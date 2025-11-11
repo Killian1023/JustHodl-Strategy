@@ -40,27 +40,59 @@ def fetch_binance_klines(symbol: str, interval: str = "5m", limit: int = 500) ->
     try:
         response = requests.get(url, params=params, timeout=15)
         response.raise_for_status()
-        raw = response.json()
+        result = response.json()
+        
+        # Handle custom proxy response format (wrapped in success/data)
+        if isinstance(result, dict):
+            if not result.get('success', False):
+                error_msg = result.get('error', 'Unknown error')
+                print(f"API error for {symbol}: {error_msg}")
+                return pd.DataFrame()
+            raw = result.get('data', [])
+        else:
+            # Direct array response (standard Binance format)
+            raw = result
+        
         if not isinstance(raw, list) or len(raw) == 0:
+            print(f"No data returned for {symbol}")
             return pd.DataFrame()
-        # Raw format per candle:
-        # [ openTime, open, high, low, close, volume, closeTime, quoteAssetVolume,
-        #   numberOfTrades, takerBuyBaseVolume, takerBuyQuoteVolume, ignore ]
-        cols = [
-            'openTime','open','high','low','close','volume','closeTime',
-            'quoteAssetVolume','numberOfTrades','takerBuyBaseVolume','takerBuyQuoteVolume','ignore'
-        ]
-        df = pd.DataFrame(raw, columns=cols)
+        
+        # Check if data is in object format (custom proxy) or array format (standard Binance)
+        if isinstance(raw[0], dict):
+            # Custom proxy format with named fields
+            df = pd.DataFrame(raw)
+            df['timestamp'] = pd.to_datetime(df['openTime'], unit='ms', utc=True)
+            df = df.rename(columns={
+                'openPrice': 'open',
+                'highPrice': 'high',
+                'lowPrice': 'low',
+                'closePrice': 'close'
+            })
+        else:
+            # Standard Binance array format
+            # [ openTime, open, high, low, close, volume, closeTime, quoteAssetVolume,
+            #   numberOfTrades, takerBuyBaseVolume, takerBuyQuoteVolume, ignore ]
+            cols = [
+                'openTime','open','high','low','close','volume','closeTime',
+                'quoteAssetVolume','numberOfTrades','takerBuyBaseVolume','takerBuyQuoteVolume','ignore'
+            ]
+            df = pd.DataFrame(raw, columns=cols)
+            df['timestamp'] = pd.to_datetime(df['openTime'], unit='ms', utc=True)
+        
         # Convert types
-        df['timestamp'] = pd.to_datetime(df['openTime'], unit='ms', utc=True)
         for col in ['open','high','low','close','volume']:
             df[col] = df[col].astype(float)
         df.set_index('timestamp', inplace=True)
         df = df[['open','high','low','close','volume']]
         return df
     
+    except requests.exceptions.RequestException as e:
+        print(f"Network error fetching {symbol}: {e}")
+        return pd.DataFrame()
     except Exception as e:
         print(f"Error fetching {symbol} data from Binance: {e}")
+        import traceback
+        traceback.print_exc()
         return pd.DataFrame()
 
 def convert_to_binance_symbol(pair: str) -> str:
