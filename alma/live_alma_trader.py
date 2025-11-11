@@ -106,8 +106,9 @@ class AlmaLiveTrader:
         self.params_dir = params_dir or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '..', 'optimization_results_Alma')
         self.aggregators: Dict[str, TickAggregator] = {s: TickAggregator(s) for s in symbols}
         self.positions: Dict[str, Position] = {}
-        self.equity = PORTFOLIO_CONFIG.get('initial_capital', 10000.0)
-        self.cash = self.equity
+        
+        # Sync with actual account balance
+        self.equity, self.cash = self._sync_account_balance()
 
         # Load per-symbol params if available
         self.params_map: Dict[str, AlmaParams] = {}
@@ -123,6 +124,44 @@ class AlmaLiveTrader:
 
         logger.info(f"AlmaLiveTrader initialized, symbols={symbols}")
 
+    def _sync_account_balance(self) -> tuple[float, float]:
+        """Sync with actual account balance from exchange"""
+        try:
+            balance_response = self.roostoo.get_balance()
+            if not balance_response.get('Success'):
+                logger.warning(f"Failed to get balance: {balance_response.get('ErrMsg')}, using default")
+                default_capital = PORTFOLIO_CONFIG.get('initial_capital', 10000.0)
+                return default_capital, default_capital
+            
+            wallet = balance_response.get('SpotWallet', {})
+            usd_balance = wallet.get('USD', {})
+            free_usd = float(usd_balance.get('Free', 0))
+            locked_usd = float(usd_balance.get('Lock', 0))
+            
+            # Calculate value of existing positions
+            position_value = 0.0
+            for asset, balances in wallet.items():
+                if asset == 'USD':
+                    continue
+                total_qty = float(balances.get('Free', 0)) + float(balances.get('Lock', 0))
+                if total_qty > 0:
+                    # We have an existing position - this shouldn't happen on fresh start
+                    logger.warning(f"Found existing {asset} position: {total_qty} (will not track)")
+            
+            total_equity = free_usd + locked_usd + position_value
+            available_cash = free_usd
+            
+            logger.info(f"💰 Account synced: Total Equity=${total_equity:.2f} | Available Cash=${available_cash:.2f}")
+            if locked_usd > 0:
+                logger.info(f"   Note: ${locked_usd:.2f} USD is locked in pending orders")
+            
+            return total_equity, available_cash
+            
+        except Exception as e:
+            logger.error(f"Error syncing balance: {e}, using default")
+            default_capital = PORTFOLIO_CONFIG.get('initial_capital', 10000.0)
+            return default_capital, default_capital
+    
     def _load_params_for_symbol(self, symbol: str) -> AlmaParams:
         # Expect file: optimization_results_Alma/<SYM>/<SYM>_best.json
         try:
@@ -157,6 +196,7 @@ class AlmaLiveTrader:
         ]
         logger.info(f"Warmup: fetching {limit} {interval} candles per symbol in {len(symbol_batches)} batches")
 
+        warmup_success = 0
         for batch_idx, batch in enumerate(symbol_batches):
             t0 = time.time()
             for symbol in batch:
@@ -178,12 +218,15 @@ class AlmaLiveTrader:
                             except Exception:
                                 pass
                         self.base_history[symbol] = df
+                        warmup_success += 1
                 except Exception as e:
                     logger.debug(f"Warmup fetch failed for {symbol}: {e}")
             if batch_idx < len(symbol_batches) - 1:
                 delay = max(0, batch_delay - (time.time() - t0))
                 if delay > 0:
                     time.sleep(delay)
+        
+        logger.info(f"✅ Warmup complete: {warmup_success}/{len(self.symbols)} symbols loaded with historical data")
 
     def _round_qty(self, symbol: str, qty: float) -> float:
         step = QUANTITY_STEP_SIZES.get(symbol, 0.001)
@@ -270,44 +313,178 @@ class AlmaLiveTrader:
             'timestamp': base_df.index[i],
         }
 
-    def _place_tp_limit(self, symbol: str, qty: float, price: float) -> Optional[int]:
+    def _place_tp_limit(self, symbol: str, qty: float, price: float, max_retries: int = 3) -> Optional[int]:
+        """Place take profit limit order with retry logic"""
         price = self._round_price(symbol, price)
         qty = self._round_qty(symbol, qty)
-        try:
-            resp = self.roostoo.sell(symbol, qty, price=price)
-            if resp.get('Success'):
-                return resp.get('OrderDetail', {}).get('OrderID')
-            logger.warning(f"[{symbol}] TP order failed: {resp}")
-        except (RoostooAPIError, RoostooOrderError) as e:
-            logger.warning(f"[{symbol}] TP order error: {e}")
+        
+        if qty <= 0:
+            logger.warning(f"[{symbol}] Invalid TP quantity: {qty}")
+            return None
+        
+        for attempt in range(max_retries):
+            try:
+                resp = self.roostoo.sell(symbol, qty, price=price)
+                if resp.get('Success'):
+                    order_id = resp.get('OrderDetail', {}).get('OrderID')
+                    logger.info(f"[{symbol}] TP limit order placed: ID={order_id}, qty={qty}, price={price}")
+                    return order_id
+                else:
+                    err_msg = resp.get('ErrMsg', 'Unknown error')
+                    logger.warning(f"[{symbol}] TP order failed (attempt {attempt+1}/{max_retries}): {err_msg}")
+                    # Don't retry on insufficient balance errors
+                    if 'insufficient balance' in err_msg.lower():
+                        return None
+                    time.sleep(0.5)
+            except (RoostooAPIError, RoostooOrderError) as e:
+                logger.warning(f"[{symbol}] TP order error (attempt {attempt+1}/{max_retries}): {e}")
+                if 'insufficient balance' in str(e).lower():
+                    return None
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)
+            except Exception as e:
+                logger.error(f"[{symbol}] Unexpected TP order error: {e}")
+                return None
+        
+        logger.error(f"[{symbol}] Failed to place TP order after {max_retries} attempts")
         return None
+    
+    def _cancel_order(self, symbol: str, order_id: int, max_retries: int = 3) -> bool:
+        """Cancel an open order with retry logic. Tries by order_id, then falls back to cancel-by-pair."""
+        for attempt in range(max_retries):
+            try:
+                # Primary: cancel by order_id
+                resp = self.roostoo.cancel_order(order_id=order_id)
+                if resp.get('Success'):
+                    logger.info(f"[{symbol}] Cancelled order {order_id}")
+                    return True
+                else:
+                    err_msg = resp.get('ErrMsg', 'Unknown error')
+                    logger.warning(f"[{symbol}] Cancel order {order_id} failed (attempt {attempt+1}/{max_retries}): {err_msg}")
+                    # If invalid id or not found, try cancel by pair to clear any hidden locks
+                    if any(k in err_msg.lower() for k in ['invalid', 'not found', 'does not exist']):
+                        try:
+                            resp2 = self.roostoo.cancel_order(pair=symbol)
+                            if resp2.get('Success'):
+                                logger.info(f"[{symbol}] Fallback cancel-by-pair succeeded for TP/pendings")
+                                return True
+                        except Exception as e2:
+                            logger.debug(f"[{symbol}] Fallback cancel-by-pair error: {e2}")
+                    if attempt < max_retries - 1:
+                        time.sleep(0.5)
+            except (RoostooAPIError, RoostooOrderError) as e:
+                logger.warning(f"[{symbol}] Cancel order {order_id} error (attempt {attempt+1}/{max_retries}): {e}")
+                # On API errors, also try fallback by pair
+                try:
+                    resp2 = self.roostoo.cancel_order(pair=symbol)
+                    if resp2.get('Success'):
+                        logger.info(f"[{symbol}] Fallback cancel-by-pair succeeded for TP/pendings")
+                        return True
+                except Exception:
+                    pass
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)
+            except Exception as e:
+                logger.error(f"[{symbol}] Unexpected cancel error: {e}")
+                return False
+        return False
 
-    def _market_buy(self, symbol: str, qty: float) -> (Optional[int], Optional[float]):
+    def _market_buy(self, symbol: str, qty: float, max_retries: int = 3) -> (Optional[int], Optional[float]):
+        """Execute market buy with retry logic and validation"""
         qty = self._round_qty(symbol, qty)
         if qty <= 0:
+            logger.warning(f"[{symbol}] Invalid buy quantity: {qty}")
             return None, None
-        try:
-            resp = self.roostoo.buy(symbol, qty)
-            if resp.get('Success'):
-                od = resp.get('OrderDetail', {})
-                return od.get('OrderID'), float(od.get('FilledAverPrice') or 0.0)
-            logger.error(f"[{symbol}] market buy failed: {resp}")
-        except (RoostooAPIError, RoostooOrderError) as e:
-            logger.error(f"[{symbol}] market buy error: {e}")
+        
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"[{symbol}] Attempting market buy: qty={qty} (attempt {attempt+1}/{max_retries})")
+                resp = self.roostoo.buy(symbol, qty)
+                
+                if resp.get('Success'):
+                    od = resp.get('OrderDetail', {})
+                    order_id = od.get('OrderID')
+                    filled_price = float(od.get('FilledAverPrice') or 0.0)
+                    
+                    if filled_price > 0:
+                        logger.info(f"[{symbol}] Market buy SUCCESS: ID={order_id}, qty={qty}, price={filled_price:.6f}")
+                        return order_id, filled_price
+                    else:
+                        logger.warning(f"[{symbol}] Market buy returned 0 price, retrying...")
+                        if attempt < max_retries - 1:
+                            time.sleep(1.0)
+                        continue
+                else:
+                    err_msg = resp.get('ErrMsg', 'Unknown error')
+                    logger.error(f"[{symbol}] Market buy failed (attempt {attempt+1}/{max_retries}): {err_msg}")
+                    
+                    # Don't retry on insufficient balance
+                    if 'insufficient' in err_msg.lower():
+                        return None, None
+                    
+                    if attempt < max_retries - 1:
+                        time.sleep(1.0)
+                        
+            except (RoostooAPIError, RoostooOrderError) as e:
+                logger.error(f"[{symbol}] Market buy error (attempt {attempt+1}/{max_retries}): {e}")
+                if 'insufficient' in str(e).lower():
+                    return None, None
+                if attempt < max_retries - 1:
+                    time.sleep(1.0)
+            except Exception as e:
+                logger.error(f"[{symbol}] Unexpected market buy error: {e}")
+                return None, None
+        
+        logger.error(f"[{symbol}] Market buy FAILED after {max_retries} attempts")
         return None, None
 
-    def _market_sell(self, symbol: str, qty: float) -> (Optional[int], Optional[float]):
+    def _market_sell(self, symbol: str, qty: float, max_retries: int = 3) -> (Optional[int], Optional[float]):
+        """Execute market sell with retry logic and validation"""
         qty = self._round_qty(symbol, qty)
         if qty <= 0:
+            logger.warning(f"[{symbol}] Invalid sell quantity: {qty}")
             return None, None
-        try:
-            resp = self.roostoo.sell(symbol, qty)
-            if resp.get('Success'):
-                od = resp.get('OrderDetail', {})
-                return od.get('OrderID'), float(od.get('FilledAverPrice') or 0.0)
-            logger.error(f"[{symbol}] market sell failed: {resp}")
-        except (RoostooAPIError, RoostooOrderError) as e:
-            logger.error(f"[{symbol}] market sell error: {e}")
+        
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"[{symbol}] Attempting market sell: qty={qty} (attempt {attempt+1}/{max_retries})")
+                resp = self.roostoo.sell(symbol, qty)
+                
+                if resp.get('Success'):
+                    od = resp.get('OrderDetail', {})
+                    order_id = od.get('OrderID')
+                    filled_price = float(od.get('FilledAverPrice') or 0.0)
+                    
+                    if filled_price > 0:
+                        logger.info(f"[{symbol}] Market sell SUCCESS: ID={order_id}, qty={qty}, price={filled_price:.6f}")
+                        return order_id, filled_price
+                    else:
+                        logger.warning(f"[{symbol}] Market sell returned 0 price, retrying...")
+                        if attempt < max_retries - 1:
+                            time.sleep(1.0)
+                        continue
+                else:
+                    err_msg = resp.get('ErrMsg', 'Unknown error')
+                    logger.error(f"[{symbol}] Market sell failed (attempt {attempt+1}/{max_retries}): {err_msg}")
+                    
+                    # Don't retry on insufficient balance - might need to cancel TP first
+                    if 'insufficient' in err_msg.lower():
+                        return None, None
+                    
+                    if attempt < max_retries - 1:
+                        time.sleep(1.0)
+                        
+            except (RoostooAPIError, RoostooOrderError) as e:
+                logger.error(f"[{symbol}] Market sell error (attempt {attempt+1}/{max_retries}): {e}")
+                if 'insufficient' in str(e).lower():
+                    return None, None
+                if attempt < max_retries - 1:
+                    time.sleep(1.0)
+            except Exception as e:
+                logger.error(f"[{symbol}] Unexpected market sell error: {e}")
+                return None, None
+        
+        logger.error(f"[{symbol}] Market sell FAILED after {max_retries} attempts")
         return None, None
 
     def _last_price(self, symbol: str) -> float:
@@ -318,9 +495,82 @@ class AlmaLiveTrader:
         # Simple cash/equity tracker (can be improved by polling API for actual balances)
         self.equity = max(self.equity, self.cash)
 
+    def _asset_from_symbol(self, symbol: str) -> str:
+        try:
+            return symbol.split('/')[0]
+        except Exception:
+            return symbol
+
+    def _get_asset_free_locked(self, asset: str) -> tuple[float, float]:
+        try:
+            bal = self.roostoo.get_balance()
+            wallet = bal.get('SpotWallet', {})
+            info = wallet.get(asset, {})
+            free = float(info.get('Free', 0))
+            locked = float(info.get('Lock', 0))
+            return free, locked
+        except Exception:
+            return 0.0, 0.0
+
+    def _check_tp_fill_and_close(self, symbol: str, pos: "Position") -> bool:
+        """Check TP order status; if filled, close position bookkeeping and log. Returns True if closed."""
+        if pos.tp_order_id is None:
+            return False
+        try:
+            resp = self.roostoo.query_order(order_id=pos.tp_order_id)
+            if not resp.get('Success'):
+                return False
+            orders = resp.get('OrderMatched', []) or resp.get('OrderList', [])
+            if not orders:
+                return False
+            od = orders[0]
+            status = str(od.get('Status', '')).lower()
+            filled_qty = float(od.get('FilledQuantity', od.get('Quantity', 0)))
+            avg_price = float(od.get('FilledAverPrice', od.get('Price', 0)) or 0.0)
+
+            # Consider only 'filled' OR fully filled quantity as TP hit
+            if status in ['filled'] or filled_qty >= pos.quantity:
+                exit_price = avg_price if avg_price > 0 else self._round_price(symbol, pos.take_profit)
+                fee = exit_price * pos.quantity * (PORTFOLIO_CONFIG.get('fee_bps', 10.0) / 10000.0)
+                self.cash += exit_price * pos.quantity - fee
+                pnl = (exit_price - pos.entry_price) * pos.quantity - fee
+                pnl_pct = (pnl / (pos.entry_price * pos.quantity)) * 100 if pos.entry_price > 0 else 0.0
+
+                # Supabase log (TP exit)
+                if getattr(pos, 'trade_id', None):
+                    self.supabase_logger.log_trade_exit(
+                        trade_id=pos.trade_id,
+                        symbol=symbol,
+                        exit_time=datetime.utcnow(),
+                        exit_price=exit_price,
+                        quantity=pos.quantity,
+                        realized_pnl=pnl,
+                        realized_pnl_pct=pnl_pct,
+                        exit_reason='TAKE_PROFIT',
+                        fees=fee,
+                        is_dry_run=False,
+                        metadata={'strategy': 'ALMA', 'tp_order_id': pos.tp_order_id}
+                    )
+                logger.info(f"[{symbol}] TAKE PROFIT filled, exit @ {exit_price:.6f}, PnL={pnl:.2f}")
+                del self.positions[symbol]
+                return True
+
+            # If order was cancelled, clear tp_order_id so we can manage manually
+            if status in ['cancelled', 'canceled']:
+                logger.info(f"[{symbol}] TP order {pos.tp_order_id} cancelled by exchange; will manage manually")
+                pos.tp_order_id = None
+                return False
+
+            # If partially filled, we could reduce position; for simplicity, keep as is until fully filled
+            return False
+        except Exception as e:
+            logger.debug(f"[{symbol}] TP status check failed: {e}")
+            return False
+
     def run(self):
         logger.info("Starting Alma live trading loop...")
         last_base_bar_time: Dict[str, Optional[datetime]] = {s: None for s in self.symbols}
+        last_status_log = time.time()
         
         # Split symbols into batches to avoid Binance 10 req/s limit
         num_batches = RATE_LIMIT_CONFIG.get('num_batches', 4)
@@ -361,9 +611,12 @@ class AlmaLiveTrader:
                 live_base = self.aggregators[symbol].resample_minutes(self.base_tf_min)
                 hist = self.base_history.get(symbol)
                 if hist is not None and not hist.empty:
-                    base_df = pd.concat([hist, live_base])
-                    base_df = base_df[~base_df.index.duplicated(keep='last')].sort_index()
-                    base_df = base_df.tail(1000)
+                    if not live_base.empty:
+                        base_df = pd.concat([hist, live_base])
+                        base_df = base_df[~base_df.index.duplicated(keep='last')].sort_index()
+                        base_df = base_df.tail(1000)
+                    else:
+                        base_df = hist
                 else:
                     base_df = live_base
                 if base_df.empty:
@@ -375,9 +628,23 @@ class AlmaLiveTrader:
                     last_base_bar_time[symbol] = current_bar_time
                     p = self.params_map[symbol]
                     signal = self._compute_signal(symbol, base_df, p)
+                    
+                    # Check position limits before entering
+                    max_positions = PORTFOLIO_CONFIG.get('max_concurrent_positions', 3)
                     if signal and symbol not in self.positions:
+                        if len(self.positions) >= max_positions:
+                            logger.debug(f"[{symbol}] Signal detected but max positions ({max_positions}) reached, skipping")
+                            continue
+                        
                         entry_price = signal['entry_price']
                         qty = self._position_size(entry_price)
+                        
+                        # Check if we have enough cash
+                        required_cash = entry_price * qty * (1 + PORTFOLIO_CONFIG.get('fee_bps', 10.0) / 10000.0)
+                        if required_cash > self.cash:
+                            logger.warning(f"[{symbol}] Insufficient cash: need ${required_cash:.2f}, have ${self.cash:.2f}")
+                            continue
+                        
                         order_id, actual_entry = self._market_buy(symbol, qty)
                         if actual_entry is None:
                             continue
@@ -389,6 +656,29 @@ class AlmaLiveTrader:
                         # rough cash update
                         fee = actual_entry * qty * (PORTFOLIO_CONFIG.get('fee_bps', 10.0) / 10000.0)
                         self.cash -= actual_entry * qty + fee
+                        
+                        # Log to Supabase (entry)
+                        trade_id = self.supabase_logger.log_trade_entry(
+                            symbol=symbol,
+                            entry_time=pos.entry_time,
+                            entry_price=actual_entry,
+                            quantity=qty,
+                            stop_loss=pos.stop_loss,
+                            take_profit=pos.take_profit,
+                            signal_strength=100,
+                            order_id=order_id,
+                            is_dry_run=False,
+                            metadata={
+                                'strategy': 'ALMA',
+                                'alt_multiplier': p.alt_multiplier,
+                                'basis_len': p.basis_len,
+                                'rr_multiplier': p.rr_multiplier,
+                                'tp_order_id': tp_id
+                            }
+                        )
+                        if trade_id:
+                            pos.trade_id = trade_id
+                        
                         # log
                         if tp_id:
                             logger.info(f"[{symbol}] Entered long via MARKET: qty={qty}, entry={actual_entry:.6f}, SL={pos.stop_loss:.6f}, TP={pos.take_profit:.6f}, TP_order={tp_id}")
@@ -398,23 +688,108 @@ class AlmaLiveTrader:
                 # 4) Manage open position: stop-loss and manual TP check (in case TP not filled)
                 if symbol in self.positions:
                     pos = self.positions[symbol]
+                    # First, check if TP has been filled
+                    if self._check_tp_fill_and_close(symbol, pos):
+                        # Position closed; skip further checks for this symbol
+                        continue
                     last_price = self._last_price(symbol)
                     if last_price <= pos.stop_loss:
-                        # Stop loss market exit
-                        _, exit_price = self._market_sell(symbol, pos.quantity)
-                        if exit_price is None:
+                        # Stop loss market exit - cancel TP order first if it exists
+                        if pos.tp_order_id is not None:
+                            cancelled = self._cancel_order(symbol, pos.tp_order_id)
+                            # Extra safety: cancel any remaining pending orders by pair
+                            if not cancelled:
+                                try:
+                                    self.roostoo.cancel_order(pair=symbol)
+                                except Exception:
+                                    pass
+                            # Clear TP id locally on successful cancel or fallback
+                            pos.tp_order_id = None
+                            # Wait briefly for exchange to release locks
+                            time.sleep(0.5)
+
+                        # Ensure asset is not locked before selling
+                        asset = self._asset_from_symbol(symbol)
+                        free, locked = self._get_asset_free_locked(asset)
+                        wait_deadline = time.time() + 3.0  # wait up to 3s
+                        while locked > 0 and time.time() < wait_deadline:
+                            logger.debug(f"[{symbol}] Waiting for locked balance to clear: locked={locked}")
+                            time.sleep(0.3)
+                            free, locked = self._get_asset_free_locked(asset)
+
+                        if locked > 0:
+                            logger.error(f"[{symbol}] Cannot execute SL: balance still locked={locked}. Skipping this loop.")
                             continue
-                        fee = exit_price * pos.quantity * (PORTFOLIO_CONFIG.get('fee_bps', 10.0) / 10000.0)
-                        self.cash += exit_price * pos.quantity - fee
-                        pnl = (exit_price - pos.entry_price) * pos.quantity - fee
-                        logger.info(f"[{symbol}] STOP LOSS triggered, exit @ {exit_price:.6f}, PnL={pnl:.2f}")
-                        del self.positions[symbol]
+
+                        # Determine sellable quantity: min of position and free balance (rounded down)
+                        sell_qty = self._round_qty(symbol, min(pos.quantity, max(0.0, free)))
+                        if sell_qty <= 0:
+                            logger.error(f"[{symbol}] Cannot execute SL: sellable qty={sell_qty}, free={free}")
+                            continue
+
+                        _, exit_price = self._market_sell(symbol, sell_qty)
+                        if exit_price is None:
+                            logger.error(f"[{symbol}] Failed to execute stop loss market sell for qty={sell_qty}")
+                            continue
+
+                        fee = exit_price * sell_qty * (PORTFOLIO_CONFIG.get('fee_bps', 10.0) / 10000.0)
+                        self.cash += exit_price * sell_qty - fee
+                        pnl = (exit_price - pos.entry_price) * sell_qty - fee
+                        pnl_pct = (pnl / (pos.entry_price * sell_qty)) * 100 if pos.entry_price > 0 else 0
+
+                        # Log to Supabase (SL exit, supports partial)
+                        if getattr(pos, 'trade_id', None):
+                            self.supabase_logger.log_trade_exit(
+                                trade_id=pos.trade_id,
+                                symbol=symbol,
+                                exit_time=datetime.utcnow(),
+                                exit_price=exit_price,
+                                quantity=sell_qty,
+                                realized_pnl=pnl,
+                                realized_pnl_pct=pnl_pct,
+                                exit_reason='STOP_LOSS' if sell_qty >= pos.quantity else 'STOP_LOSS_PARTIAL',
+                                fees=fee,
+                                is_dry_run=False,
+                                metadata={'strategy': 'ALMA'}
+                            )
+
+                        if sell_qty >= pos.quantity - 1e-12:
+                            logger.info(f"[{symbol}] STOP LOSS triggered, exit @ {exit_price:.6f}, qty={sell_qty}, PnL={pnl:.2f}")
+                            del self.positions[symbol]
+                        else:
+                            # Partial exit: reduce position and continue managing remainder
+                            pos.quantity = max(0.0, pos.quantity - sell_qty)
+                            logger.info(f"[{symbol}] STOP LOSS partial exit @ {exit_price:.6f}, sold={sell_qty}, remaining={pos.quantity}")
                     elif last_price >= pos.take_profit and pos.tp_order_id is None:
-                        # Place TP if not already placed (safety)
-                        pos.tp_order_id = self._place_tp_limit(symbol, pos.quantity, pos.take_profit)
+                        # Only try to place TP once - don't retry if it failed
+                        # (pos.tp_order_id remains None if placement failed initially)
+                        pass
 
             # end symbols loop
             self._update_equity_cache()
+            
+            # Log position status every 5 minutes
+            if time.time() - last_status_log >= 300:  # 300 seconds = 5 minutes
+                last_status_log = time.time()
+                if self.positions:
+                    logger.info("=" * 80)
+                    logger.info(f"📊 Position Status Report | Equity: ${self.equity:.2f} | Cash: ${self.cash:.2f}")
+                    logger.info("=" * 80)
+                    for symbol, pos in self.positions.items():
+                        current_price = self._last_price(symbol)
+                        pnl = (current_price - pos.entry_price) * pos.quantity if current_price > 0 else 0.0
+                        pnl_pct = (pnl / (pos.entry_price * pos.quantity)) * 100 if pos.entry_price > 0 else 0.0
+                        duration = datetime.utcnow() - pos.entry_time
+                        logger.info(
+                            f"  {symbol:12} | Entry: ${pos.entry_price:.6f} | Current: ${current_price:.6f} | "
+                            f"Qty: {pos.quantity:.4f} | PnL: ${pnl:.2f} ({pnl_pct:+.2f}%) | "
+                            f"SL: ${pos.stop_loss:.6f} | TP: ${pos.take_profit:.6f} | "
+                            f"Duration: {str(duration).split('.')[0]}"
+                        )
+                    logger.info("=" * 80)
+                else:
+                    logger.info(f"📊 No open positions | Equity: ${self.equity:.2f} | Cash: ${self.cash:.2f}")
+            
             # sleep remaining
             elapsed = time.time() - loop_start
             time.sleep(max(0.5, self.poll_seconds - elapsed))
