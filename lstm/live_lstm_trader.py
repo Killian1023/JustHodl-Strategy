@@ -21,14 +21,13 @@ import torch
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from lstm.origin.technical_indicators import add_technical_indicators
 
 from lstm.vcre_data_feed import VCREDataFeed
 from lstm.origin.train_profit_opportunity import ProfitOpportunityPreprocessor, ProfitOpportunityLSTM
-from lstm.origin.technical_indicators import add_technical_indicators
 from roostoo_trading import RoostooClient, RoostooAPIError, RoostooOrderError
-from roostoo_trading.config import ROOSTOO_CONFIG
-from vcre.supabase_logger import SupabaseLogger
-from vcre.live_trading_config import QUANTITY_STEP_SIZES, PRICE_STEP_SIZES
+from utils.supabase_logger import SupabaseLogger
+from utils.live_trading_config import QUANTITY_STEP_SIZES, PRICE_STEP_SIZES
 
 # Setup logging
 logging.basicConfig(
