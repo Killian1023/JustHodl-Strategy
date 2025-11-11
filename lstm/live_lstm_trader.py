@@ -24,9 +24,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lstm.vcre_data_feed import VCREDataFeed
 from lstm.origin.train_profit_opportunity import ProfitOpportunityPreprocessor, ProfitOpportunityLSTM
+from lstm.origin.technical_indicators import add_technical_indicators
 from roostoo_trading import RoostooClient, RoostooAPIError, RoostooOrderError
-from utils.supabase_logger import SupabaseLogger
-from utils.live_trading_config import QUANTITY_STEP_SIZES, PRICE_STEP_SIZES
+from roostoo_trading.config import ROOSTOO_CONFIG
+from vcre.supabase_logger import SupabaseLogger
+from vcre.live_trading_config import QUANTITY_STEP_SIZES, PRICE_STEP_SIZES
 
 # Setup logging
 logging.basicConfig(
@@ -72,7 +74,7 @@ class LSTMLiveTradingStrategy:
         stop_loss_pct: float = -0.01,  # -1%
         take_profit_pct: float = 0.01,  # +1%
         max_hold_periods: int = 5,  # 5 periods = 75 minutes for 15m candles
-        position_size_pct: float = 0.5,
+        position_size_pct: float = 0.95,
         max_capital_usd: Optional[float] = None,
         dry_run: bool = True,
         fee_bps: float = 10.0
@@ -199,20 +201,31 @@ class LSTMLiveTradingStrategy:
     def predict(self, df: pd.DataFrame) -> float:
         """Generate prediction for the latest data point"""
         try:
-            # Prepare data (use fitted scaler)
-            X, _ = self.preprocessor.prepare_data(df, fit_scaler=False)
+            # Pure inference path (no label alignment). Use latest CLOSED candles only.
+            df2 = df.copy()
+            df2 = add_technical_indicators(df2)
             
-            if len(X) == 0:
-                logger.warning("No valid sequences for prediction")
+            # Extract features using preprocessor's feature_columns
+            feat_mat = df2[self.preprocessor.feature_columns].values
+            
+            # Use fitted scaler from training
+            if not getattr(self.preprocessor, 'is_fitted', False):
+                logger.warning("Preprocessor scaler not fitted; returning 0.0")
+                return 0.0
+            feat_scaled = self.preprocessor.scaler.transform(feat_mat)
+            
+            seq_len = self.preprocessor.sequence_length
+            if len(feat_scaled) < seq_len:
+                logger.warning("Insufficient data for prediction")
                 return 0.0
             
-            # Get last sequence
-            x = torch.tensor(X[-1:], dtype=torch.float32, device=self.device)
+            # Last sequence window
+            x_seq = feat_scaled[-seq_len:]
+            x = torch.tensor(x_seq[None, ...], dtype=torch.float32, device=self.device)
             
             with torch.no_grad():
                 logit = self.model(x)
                 prob = torch.sigmoid(logit).cpu().item()
-            
             return prob
         except Exception as e:
             logger.error(f"Error in prediction: {e}")
@@ -665,7 +678,7 @@ class LSTMLiveTrader:
         buy_threshold: float = 0.90,
         timeframe_minutes: int = 15,
         check_interval: int = 60,
-        position_size_pct: float = 0.5,
+        position_size_pct: float = 0.95,
         dry_run: bool = True,
         max_capital_usd: Optional[float] = None,
         enable_supabase: bool = True,
