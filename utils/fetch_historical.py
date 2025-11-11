@@ -26,7 +26,7 @@ def fetch_binance_klines(symbol: str, interval: str = "5m", limit: int = 500) ->
     Returns:
         DataFrame with OHLCV data
     """
-    url = f"{BINANCE_URL.rstrip('/')}/api/v3/klines"
+    url = f"{BINANCE_URL.rstrip('/')}/api/klines"
     
     # Binance supports up to 1000 candles per request
     limit = min(limit, 1000)
