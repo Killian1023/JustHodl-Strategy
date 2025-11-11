@@ -18,7 +18,7 @@ TRADING_CONFIG = {
     'max_hold_periods': 5,       # Max 5 periods (75 minutes for 15m candles)
     
     # Position sizing
-    'position_size_pct': 0.5,   # Use 50% of equity per trade (use 0.85 for 85%)
+    'position_size_pct': 0.45,   # Use 50% of equity per trade (use 0.85 for 85%)
     'max_capital_usd': None,   # Hard cap: max $1000 per trade (None = no limit)
     'initial_capital': 10000.0,  # Initial capital for dry run mode
     

@@ -34,7 +34,7 @@ class AlmaParams:
 PORTFOLIO_CONFIG = {
     "initial_capital": 50000.0,
     "max_concurrent_positions": 3,
-    "position_size_pct": 16.5,
+    "position_size_pct": 18,
     "fee_bps": 10.0,
 }
 
