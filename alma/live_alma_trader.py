@@ -759,7 +759,13 @@ class AlmaLiveTrader:
                         else:
                             # Partial exit: reduce position and continue managing remainder
                             pos.quantity = max(0.0, pos.quantity - sell_qty)
-                            logger.info(f"[{symbol}] STOP LOSS partial exit @ {exit_price:.6f}, sold={sell_qty}, remaining={pos.quantity}")
+                            # Check if remaining quantity is below minimum tradeable amount (dust)
+                            min_tradeable = self._round_qty(symbol, pos.quantity)
+                            if min_tradeable <= 0:
+                                logger.info(f"[{symbol}] STOP LOSS partial exit @ {exit_price:.6f}, sold={sell_qty}, remaining={pos.quantity} (dust - closing position)")
+                                del self.positions[symbol]
+                            else:
+                                logger.info(f"[{symbol}] STOP LOSS partial exit @ {exit_price:.6f}, sold={sell_qty}, remaining={pos.quantity}")
                     elif last_price >= pos.take_profit and pos.tp_order_id is None:
                         # Only try to place TP once - don't retry if it failed
                         # (pos.tp_order_id remains None if placement failed initially)
