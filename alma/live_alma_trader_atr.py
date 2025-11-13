@@ -14,6 +14,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List
+from decimal import Decimal, getcontext, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING
 
 import numpy as np
 import pandas as pd
@@ -37,6 +38,9 @@ from live_alma_config import (
     RATE_LIMIT_CONFIG,
 )
 from clear_account import cancel_all_orders, close_all_positions
+
+
+getcontext().prec = 28
 
 
 logging.basicConfig(
@@ -293,14 +297,24 @@ class AlmaLiveTrader:
         scaled = int((qty + 1e-12) / step) * step
         return round(scaled, dp)
 
-    def _round_price(self, symbol: str, price: float) -> float:
+    def _round_price(self, symbol: str, price: float, *, mode: str = 'nearest') -> float:
+        """Round price to tick size with selectable mode (nearest/ceil/floor)."""
         tick = PRICE_STEP_SIZES.get(symbol, 0.01)
-        if tick >= 1:
-            dp = 0
+        if tick is None or tick <= 0:
+            tick = 0.01
+
+        price_dec = Decimal(str(price))
+        tick_dec = Decimal(str(tick))
+
+        if mode == 'ceil':
+            steps = (price_dec / tick_dec).to_integral_value(rounding=ROUND_CEILING)
+        elif mode == 'floor':
+            steps = (price_dec / tick_dec).to_integral_value(rounding=ROUND_FLOOR)
         else:
-            dp = len(str(tick).split('.')[-1])
-        rounded = round(price / tick) * tick
-        return round(rounded, dp)
+            steps = (price_dec / tick_dec).to_integral_value(rounding=ROUND_HALF_UP)
+
+        rounded = steps * tick_dec
+        return float(rounded)
 
     def _position_size(self, price: float) -> float:
         """
@@ -384,9 +398,21 @@ class AlmaLiveTrader:
             # Use a minimal buffer based on ATR or small percentage
             fallback = atr_mult * atr_val if atr_val > 0 else entry * 0.005
             sl = entry - max(1e-9, fallback)
-        
+
         risk = entry - sl
         tp = entry + p.rr_multiplier * risk
+
+        tick = PRICE_STEP_SIZES.get(symbol, 0.01) or 0.01
+
+        sl = max(sl, 0.0)
+        sl = self._round_price(symbol, sl, mode='floor')
+        tp = self._round_price(symbol, tp, mode='ceil')
+
+        if tp <= entry:
+            tp = self._round_price(symbol, entry + tick, mode='ceil')
+        if sl >= entry:
+            sl = self._round_price(symbol, max(entry - tick, 0.0), mode='floor')
+
         return {
             'symbol': symbol,
             'entry_price': entry,
@@ -397,7 +423,7 @@ class AlmaLiveTrader:
 
     def _place_tp_limit(self, symbol: str, qty: float, price: float, max_retries: int = 3) -> Optional[int]:
         """Place take profit limit order with retry logic"""
-        price = self._round_price(symbol, price)
+        price = self._round_price(symbol, price, mode='ceil')
 
         # Cap TP quantity by currently free balance for the asset to avoid insufficient balance
         asset = self._asset_from_symbol(symbol)
@@ -849,9 +875,15 @@ class AlmaLiveTrader:
                         
                         # log
                         if tp_id:
-                            logger.info(f"[{symbol}] Entered long via MARKET: qty={actual_qty}, entry={actual_entry:.6f}, SL={pos.stop_loss:.6f}, TP={pos.take_profit:.6f}, TP_order={tp_id}")
+                            logger.info(
+                                f"[{symbol}] Entered long via MARKET: qty={actual_qty}, entry={actual_entry:.8f}, "
+                                f"SL={pos.stop_loss:.8f}, TP={pos.take_profit:.8f}, TP_order={tp_id}"
+                            )
                         else:
-                            logger.info(f"[{symbol}] Entered long via MARKET: qty={actual_qty}, entry={actual_entry:.6f}, SL={pos.stop_loss:.6f}, TP={pos.take_profit:.6f}")
+                            logger.info(
+                                f"[{symbol}] Entered long via MARKET: qty={actual_qty}, entry={actual_entry:.8f}, "
+                                f"SL={pos.stop_loss:.8f}, TP={pos.take_profit:.8f}"
+                            )
 
                 # 4) Manage open position: stop-loss and manual TP check (in case TP not filled)
                 if symbol in self.positions:
@@ -983,9 +1015,9 @@ class AlmaLiveTrader:
                         pnl_pct = (pnl / (pos.entry_price * pos.quantity)) * 100 if pos.entry_price > 0 else 0.0
                         duration = datetime.utcnow() - pos.entry_time
                         logger.info(
-                            f"  {symbol:12} | Entry: ${pos.entry_price:.6f} | Current: ${current_price:.6f} | "
+                            f"  {symbol:12} | Entry: ${pos.entry_price:.8f} | Current: ${current_price:.8f} | "
                             f"Qty: {pos.quantity:.4f} | PnL: ${pnl:.2f} ({pnl_pct:+.2f}%) | "
-                            f"SL: ${pos.stop_loss:.6f} | TP: ${pos.take_profit:.6f} | "
+                            f"SL: ${pos.stop_loss:.8f} | TP: ${pos.take_profit:.8f} | "
                             f"Duration: {str(duration).split('.')[0]}"
                         )
                     logger.info("=" * 80)
