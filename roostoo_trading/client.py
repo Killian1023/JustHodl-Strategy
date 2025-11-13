@@ -145,6 +145,25 @@ class RoostooClient:
         
         response = requests.get(url, headers=headers, params=payload)
         return self._handle_response(response)
+
+    def get_ticker(self, pair: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get market ticker(s).
+        If pair is provided (e.g., "BTC/USD"), returns only that pair. Otherwise returns all pairs.
+
+        Auth: RCL_TSCheck (signed headers with timestamp)
+
+        Returns:
+            Dictionary with Data mapping pair -> ticker fields including LastPrice
+        """
+        url = f"{self.base_url}/v3/ticker"
+        payload: Dict[str, Any] = {}
+        if pair is not None:
+            payload['pair'] = pair
+        headers, payload, _ = self._get_signed_headers(payload)
+        response = requests.get(url, headers=headers, params=payload)
+        return self._handle_response(response)
+
     
     def get_pending_count(self) -> Dict[str, Any]:
         """

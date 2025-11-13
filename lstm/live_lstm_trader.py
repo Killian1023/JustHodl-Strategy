@@ -153,18 +153,52 @@ class LSTMLiveTradingStrategy:
             
             wallet = balance.get('SpotWallet', {}) or balance.get('Wallet', {}) or {}
             usd_info = self._get_wallet_asset(wallet, 'USD')
-            
             if usd_info is None:
                 return 10000.0, 10000.0, False
-            
-            free = float(usd_info.get('Free', 0) or 0)
-            locked = float(usd_info.get('Lock', 0) or 0)
-            total_usd = free + locked
-            
-            if total_usd <= 0:
-                return 10000.0, 10000.0, False
-            
-            return free, total_usd, True
+
+            # USD cash components
+            usd_free = float(usd_info.get('Free', 0) or 0)
+            usd_locked = float(usd_info.get('Lock', 0) or 0)
+
+            # Fetch all tickers once and build price map
+            prices: Dict[str, float] = {}
+            try:
+                tick = self.client.get_ticker()  # may be large; but single call
+                if tick and tick.get('Success') and isinstance(tick.get('Data'), dict):
+                    for pair, fields in tick['Data'].items():
+                        try:
+                            lp = float(fields.get('LastPrice', 0) or 0)
+                            if lp > 0:
+                                prices[pair.upper()] = lp
+                        except Exception:
+                            continue
+            except Exception:
+                # If ticker fails, fallback to USD-only valuation
+                total_equity = usd_free + usd_locked
+                return usd_free, total_equity, True
+
+            # Sum USD value of all non-USD holdings
+            non_usd_value = 0.0
+            for asset, balances in wallet.items():
+                if asset == 'USD':
+                    continue
+                try:
+                    qty_free = float(balances.get('Free', 0) or 0)
+                    qty_locked = float(balances.get('Lock', 0) or 0)
+                    qty_total = qty_free + qty_locked
+                    if qty_total <= 0:
+                        continue
+                    pair = f"{asset}/USD".upper()
+                    price = prices.get(pair)
+                    if price is None:
+                        # No direct USD pair price available; skip
+                        continue
+                    non_usd_value += qty_total * price
+                except Exception:
+                    continue
+
+            total_equity = usd_free + usd_locked + non_usd_value
+            return usd_free, total_equity, True
         except Exception as e:
             logger.error(f"Error fetching account equity: {e}")
             return 10000.0, 10000.0, False
@@ -429,29 +463,34 @@ class LSTMLiveTradingStrategy:
         Uses TOTAL equity (not available cash) to maintain consistent allocation
         even when other strategies have open positions.
         """
-        # Use percentage of TOTAL equity (not just available cash)
-        position_value = self.equity * self.position_size_pct
+        # Target value by TOTAL equity
+        target_by_equity = self.equity * self.position_size_pct
         
-        # Account for fees (pre-deduct)
+        # Account for fees (pre-deduct so quantity*price + fee ~= target)
         fee_rate = self.fee_bps / 10000
-        position_value = position_value / (1 + fee_rate)
+        target_net = target_by_equity / (1 + fee_rate)
         
-        # Apply max capital limit if set
+        # Apply optional absolute cap
         if self.max_capital_usd is not None:
-            position_value = min(position_value, float(self.max_capital_usd))
+            target_net = min(target_net, float(self.max_capital_usd) / (1 + fee_rate))
         
-        # Check if we have enough cash for this position
+        # Fee-aware available cash cap: ensure we never attempt to spend more than available cash - buffer
         min_buffer = 10.0  # Keep at least $10 buffer
-        if position_value > (self.cash - min_buffer):
-            logger.warning(f"Insufficient cash for {self.position_size_pct*100:.0f}% position: need ${position_value:.2f}, have ${self.cash:.2f}")
-            logger.warning(f"This may indicate other strategies are using capital. Position will not be opened.")
-            return 0.0
+        available_cash = max(0.0, self.cash - min_buffer)
+        available_net = available_cash / (1 + fee_rate)
+        
+        # Final position value is the min of target and what we can afford
+        position_value = min(target_net, available_net)
+        if position_value < target_net - 1e-9:
+            logger.info(
+                f"Capping position to available cash: target_net=${target_net:.2f}, available_net=${available_net:.2f}, using=${position_value:.2f}"
+            )
         
         if position_value <= 0:
-            logger.warning(f"Invalid position value: ${position_value:.2f}")
+            logger.warning(f"Position value <= 0 after capping. Cash=${self.cash:.2f}, equity=${self.equity:.2f}")
             return 0.0
         
-        # Calculate quantity
+        # Calculate quantity from final position value
         quantity = position_value / entry_price
         
         # Round to proper step size

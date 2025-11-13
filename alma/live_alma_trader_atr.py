@@ -143,18 +143,48 @@ class AlmaLiveTrader:
             usd_balance = wallet.get('USD', {})
             free_usd = float(usd_balance.get('Free', 0))
             locked_usd = float(usd_balance.get('Lock', 0))
-            
-            # Calculate value of existing positions
-            position_value = 0.0
+
+            # Build price map from tickers (single call)
+            prices: dict[str, float] = {}
+            try:
+                tick = self.roostoo.get_ticker()
+                if tick and tick.get('Success') and isinstance(tick.get('Data'), dict):
+                    for pair, fields in tick['Data'].items():
+                        try:
+                            lp = float(fields.get('LastPrice', 0) or 0)
+                            if lp > 0:
+                                prices[pair.upper()] = lp
+                        except Exception:
+                            continue
+            except Exception as e:
+                logger.warning(f"Ticker fetch failed, using USD-only equity: {e}")
+                total_equity = free_usd + locked_usd
+                available_cash = free_usd
+                logger.info(f"💰 Account synced: Total Equity=${total_equity:.2f} | Available Cash=${available_cash:.2f}")
+                if locked_usd > 0:
+                    logger.info(f"   Note: ${locked_usd:.2f} USD is locked in pending orders")
+                return total_equity, available_cash
+
+            # Sum non-USD holdings using <ASSET>/USD prices
+            non_usd_value = 0.0
             for asset, balances in wallet.items():
                 if asset == 'USD':
                     continue
-                total_qty = float(balances.get('Free', 0)) + float(balances.get('Lock', 0))
-                if total_qty > 0:
-                    # We have an existing position - this shouldn't happen on fresh start
-                    logger.warning(f"Found existing {asset} position: {total_qty} (will not track)")
-            
-            total_equity = free_usd + locked_usd + position_value
+                try:
+                    qty_free = float(balances.get('Free', 0) or 0)
+                    qty_locked = float(balances.get('Lock', 0) or 0)
+                    qty_total = qty_free + qty_locked
+                    if qty_total <= 0:
+                        continue
+                    pair = f"{asset}/USD".upper()
+                    price = prices.get(pair)
+                    if price is None:
+                        continue
+                    non_usd_value += qty_total * price
+                except Exception:
+                    continue
+
+            total_equity = free_usd + locked_usd + non_usd_value
             available_cash = free_usd
             
             logger.info(f"💰 Account synced: Total Equity=${total_equity:.2f} | Available Cash=${available_cash:.2f}")
