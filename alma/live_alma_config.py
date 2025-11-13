@@ -38,10 +38,14 @@ class AlmaParams:
 PORTFOLIO_CONFIG = {
     "initial_capital": 50000.0,
     "max_concurrent_positions": 3,
-    "position_size_pct": 18,
+    "position_size_pct": 18,  # 18% per position × 3 max = 54% total equity allocation
     "fee_bps": 10.0,
     "clear_account_on_start": True,
     "clear_account_on_end": True,
+    # Note: Position sizing uses TOTAL equity, not available cash
+    # This ensures consistent allocation even when LSTM (45%) has open positions
+    # Total allocation: ALMA 54% + LSTM 45% = 99% (1% buffer)
+    # IMPORTANT: ALMA excludes BTC when clearing account (BTC reserved for LSTM)
 }
 
 RISK_CONFIG = {

@@ -10,23 +10,27 @@ TRADING_CONFIG = {
     'pair': 'BTC/USD',
     
     # Model prediction threshold for buy signal
-    'buy_threshold': 0.85,
+    'buy_threshold': 0.25,
     
     # Risk management
-    'stop_loss_pct': -0.01,      # -0.1% stop loss (use -0.01 for -1%)
-    'take_profit_pct': 0.01,     # +0.1% take profit (use 0.01 for +1%)
+    'stop_loss_pct': -0.001,      # -0.1% stop loss (use -0.01 for -1%)
+    'take_profit_pct': 0.001,     # +0.1% take profit (use 0.01 for +1%)
     'max_hold_periods': 5,       # Max 5 periods (75 minutes for 15m candles)
     
     # Position sizing
-    'position_size_pct': 0.45,   # Use 50% of equity per trade (use 0.85 for 85%)
-    'max_capital_usd': None,   # Hard cap: max $1000 per trade (None = no limit)
+    'position_size_pct': 0.45,   # Use 45% of TOTAL equity per trade
+    'use_total_equity': True,    # Calculate from total equity, not available cash
+    'max_capital_usd': None,     # Hard cap: max $X per trade (None = no limit)
     'initial_capital': 10000.0,  # Initial capital for dry run mode
+    
+    # Startup behavior
+    'clear_position_on_start': True,  # Auto-close any existing position on startup
     
     # Fees
     'fee_bps': 10.0,             # Trading fee in basis points (10 = 0.1%)
     
     # Data feed
-    'timeframe_minutes': 15,     # 15-minute candles (must match model training)
+    'timeframe_minutes': 5,     # 15-minute candles (must match model training)
     'warmup_candles': 300,       # Number of historical candles to load
     
     # Polling interval

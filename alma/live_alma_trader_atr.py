@@ -273,11 +273,22 @@ class AlmaLiveTrader:
         return round(rounded, dp)
 
     def _position_size(self, price: float) -> float:
+        """
+        Calculate position size based on TOTAL equity.
+        Each ALMA position uses 18% of total equity (max 3 positions = 54% total).
+        """
         pct = PORTFOLIO_CONFIG.get('position_size_pct', 100.0) / 100.0
         fee = PORTFOLIO_CONFIG.get('fee_bps', 10.0) / 10000.0
         value = self.equity * pct
         value = value / (1 + fee)
-        value = min(value, self.cash)
+        
+        # Check if we have enough cash (don't cap at cash, just validate)
+        min_buffer = 10.0
+        if value > (self.cash - min_buffer):
+            logger.warning(f"Insufficient cash for {pct*100:.0f}% position: need ${value:.2f}, have ${self.cash:.2f}")
+            logger.warning(f"This may indicate LSTM or other positions are using capital.")
+            return 0.0
+        
         qty = max(value / max(price, 1e-9), 0.0)
         return qty
 
@@ -669,9 +680,10 @@ class AlmaLiveTrader:
         if PORTFOLIO_CONFIG.get('clear_account_on_start', False):
             try:
                 logger.info("Clearing account at startup: cancelling orders and closing positions...")
+                logger.info("(Excluding BTC - reserved for LSTM strategy)")
                 cancel_all_orders(self.roostoo)
                 time.sleep(1.0)
-                close_all_positions(self.roostoo)
+                close_all_positions(self.roostoo, exclude_assets=['BTC'])
                 logger.info("Account clear completed")
             except Exception as e:
                 logger.warning(f"Account clear on start failed: {e}")
@@ -681,9 +693,10 @@ class AlmaLiveTrader:
             def _clear_on_exit():
                 try:
                     logger.info("Clearing account on shutdown: cancelling orders and closing positions...")
+                    logger.info("(Excluding BTC - reserved for LSTM strategy)")
                     cancel_all_orders(self.roostoo)
                     time.sleep(1.0)
-                    close_all_positions(self.roostoo)
+                    close_all_positions(self.roostoo, exclude_assets=['BTC'])
                     logger.info("Shutdown account clear completed")
                 except Exception as e:
                     logger.warning(f"Account clear on shutdown failed: {e}")

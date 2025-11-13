@@ -136,7 +136,7 @@ def cancel_all_orders(client):
     return failed_count == 0
 
 
-def close_all_positions(client):
+def close_all_positions(client: RoostooClient, exclude_assets: list = None) -> bool:
     """Close all open positions using market orders"""
     print("\n" + "=" * 60)
     print("STEP 2: Closing All Open Positions")
@@ -157,10 +157,18 @@ def close_all_positions(client):
         print(f"❌ Error getting balance: {e}")
         return False
     
-    # Find all non-USD holdings
+    # Find all non-USD holdings (excluding specified assets)
+    if exclude_assets is None:
+        exclude_assets = []
+    
     positions_to_close = []
     for asset, balances in wallet.items():
         if asset == 'USD':
+            continue
+        
+        # Skip excluded assets (e.g., BTC for ALMA since LSTM trades it)
+        if asset in exclude_assets:
+            print(f"  ⏭️  Skipping {asset} (reserved for other strategy)")
             continue
         
         free = balances.get('Free', 0)

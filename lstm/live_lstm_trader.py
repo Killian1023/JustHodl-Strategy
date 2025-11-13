@@ -96,6 +96,10 @@ class LSTMLiveTradingStrategy:
         # Position tracking
         self.position: Optional[Position] = None
         
+        # Extract currencies (needed before portfolio init)
+        self.base_currency = pair.split('/')[0]
+        self.quote_currency = pair.split('/')[1]
+        
         # Portfolio state
         self.equity = 0.0
         self.cash = 0.0
@@ -103,10 +107,6 @@ class LSTMLiveTradingStrategy:
         
         # Trade history
         self.trades = []
-        
-        # Extract currencies
-        self.base_currency = pair.split('/')[0]
-        self.quote_currency = pair.split('/')[1]
         
         # Fee configuration
         self.fee_bps = fee_bps  # 0.1% fee (10 basis points)
@@ -140,6 +140,9 @@ class LSTMLiveTradingStrategy:
         
         if not success:
             logger.warning("Failed to fetch account balance, using default values")
+        
+        # Check for existing position on startup (prevent phantom positions)
+        self._sync_position_on_startup()
     
     def _fetch_account_equity(self) -> Tuple[float, float, bool]:
         """Fetch account equity from Roostoo API"""
@@ -165,6 +168,83 @@ class LSTMLiveTradingStrategy:
         except Exception as e:
             logger.error(f"Error fetching account equity: {e}")
             return 10000.0, 10000.0, False
+    
+    def _sync_account_balance(self) -> Tuple[float, float]:
+        """Sync cash and equity from live account"""
+        cash, equity, success = self._fetch_account_equity()
+        if success:
+            logger.info(f"💰 Account synced: Equity=${equity:.2f} | Cash=${cash:.2f}")
+        return cash, equity
+    
+    def _get_asset_free_locked(self, asset: str) -> Tuple[float, float]:
+        """Get free and locked balance for an asset"""
+        try:
+            bal = self.client.get_balance()
+            if not bal or not bal.get('Success'):
+                return 0.0, 0.0
+            wallet = bal.get('SpotWallet', {}) or bal.get('Wallet', {}) or {}
+            info = self._get_wallet_asset(wallet, asset)
+            if info is None:
+                return 0.0, 0.0
+            free = float(info.get('Free', 0) or 0)
+            locked = float(info.get('Lock', 0) or 0)
+            return free, locked
+        except Exception:
+            return 0.0, 0.0
+    
+    def _sync_position_on_startup(self):
+        """
+        Check for existing position on startup and clear it.
+        Prevents phantom positions from previous runs.
+        """
+        if self.dry_run:
+            return
+        
+        # Check if startup clearing is enabled
+        try:
+            from lstm.live_trading_config import TRADING_CONFIG
+            clear_on_start = TRADING_CONFIG.get('clear_position_on_start', True)
+        except:
+            clear_on_start = True
+        
+        if not clear_on_start:
+            logger.info("Startup position clearing disabled in config")
+            return
+        
+        try:
+            free, locked = self._get_asset_free_locked(self.base_currency)
+            total_balance = free + locked
+            
+            if total_balance > 0:
+                logger.warning(f"⚠️  Found existing {self.base_currency} balance on startup: {total_balance:.8f}")
+                logger.warning(f"This may be from a previous run. Clearing position to prevent phantom trades.")
+                
+                # Close the position immediately
+                current_price = None
+                try:
+                    # Try to get current price from data feed
+                    from lstm.vcre_data_feed import VCREDataFeed
+                    temp_feed = VCREDataFeed(self.pair, timeframe_minutes=5)
+                    current_price = temp_feed.get_current_price()
+                except Exception:
+                    pass
+                
+                if current_price and current_price > 0:
+                    # Sell the position
+                    try:
+                        response = self.client.sell(self.pair, total_balance)
+                        if response.get('Success'):
+                            logger.info(f"✅ Cleared startup position: sold {total_balance:.8f} {self.base_currency} @ ${current_price:.2f}")
+                        else:
+                            logger.error(f"❌ Failed to clear startup position: {response.get('ErrMsg')}")
+                    except Exception as e:
+                        logger.error(f"❌ Error clearing startup position: {e}")
+                else:
+                    logger.warning(f"Could not get current price to clear position. Manual intervention may be needed.")
+            else:
+                logger.info(f"✅ No existing {self.base_currency} position found on startup")
+        except Exception as e:
+            logger.error(f"Error syncing position on startup: {e}")
     
     def get_balance(self) -> Dict[str, float]:
         """Get current balance from Roostoo API"""
@@ -245,7 +325,6 @@ class LSTMLiveTradingStrategy:
         # Generate prediction
         prob = self.predict(df)
         
-        print(f"🤖 Model prediction: {prob:.4f}")
         logger.info(f"🤖 Model prediction: {prob:.4f}")
         
         # Check if signal meets threshold
@@ -262,18 +341,11 @@ class LSTMLiveTradingStrategy:
                 'timestamp': datetime.now()
             }
             
-            print(f"\n✅ Buy signal! (prob {prob:.4f} >= threshold {self.buy_threshold:.2f})")
-            print(f"   Entry: ${current_price:,.2f}")
-            print(f"   Stop Loss: ${stop_loss:,.2f} ({self.stop_loss_pct*100:.1f}%)")
-            print(f"   Take Profit: ${take_profit:,.2f} ({self.take_profit_pct*100:.1f}%)")
-            logger.info(f"✅ Buy signal! (prob {prob:.4f} >= threshold {self.buy_threshold:.2f})")
-            logger.info(f"   Entry: ${current_price:,.2f}")
-            logger.info(f"   Stop Loss: ${stop_loss:,.2f} ({self.stop_loss_pct*100:.1f}%)")
-            logger.info(f"   Take Profit: ${take_profit:,.2f} ({self.take_profit_pct*100:.1f}%)")
+            logger.info(f"✅ Buy signal! prob={prob:.4f}, entry=${current_price:.2f}, SL=${stop_loss:.2f}, TP=${take_profit:.2f}")
             
             return signal
         else:
-            logger.info(f"⏸️  No signal (prob {prob:.4f} < threshold {self.buy_threshold:.2f})")
+            logger.debug(f"No signal: prob={prob:.4f} < threshold={self.buy_threshold:.2f}")
             return None
     
     def check_exit_signal(self, current_price: float, current_high: float = None, current_low: float = None) -> Optional[str]:
@@ -352,8 +424,12 @@ class LSTMLiveTradingStrategy:
         return rounded
     
     def calculate_position_size(self, entry_price: float) -> float:
-        """Calculate position size based on portfolio allocation"""
-        # Use percentage of current equity
+        """
+        Calculate position size based on portfolio allocation.
+        Uses TOTAL equity (not available cash) to maintain consistent allocation
+        even when other strategies have open positions.
+        """
+        # Use percentage of TOTAL equity (not just available cash)
         position_value = self.equity * self.position_size_pct
         
         # Account for fees (pre-deduct)
@@ -364,12 +440,15 @@ class LSTMLiveTradingStrategy:
         if self.max_capital_usd is not None:
             position_value = min(position_value, float(self.max_capital_usd))
         
-        # Don't exceed available cash (keep small buffer)
-        min_buffer = 10.0  # Keep at least $10
-        position_value = min(position_value, self.cash - min_buffer)
+        # Check if we have enough cash for this position
+        min_buffer = 10.0  # Keep at least $10 buffer
+        if position_value > (self.cash - min_buffer):
+            logger.warning(f"Insufficient cash for {self.position_size_pct*100:.0f}% position: need ${position_value:.2f}, have ${self.cash:.2f}")
+            logger.warning(f"This may indicate other strategies are using capital. Position will not be opened.")
+            return 0.0
         
         if position_value <= 0:
-            logger.warning(f"Insufficient cash: ${self.cash:.2f}")
+            logger.warning(f"Invalid position value: ${position_value:.2f}")
             return 0.0
         
         # Calculate quantity
@@ -393,7 +472,7 @@ class LSTMLiveTradingStrategy:
         logger.debug(f"Cash after exit: ${self.cash:.2f} (proceeds: ${proceeds:.2f}, fee: ${fee:.2f})")
     
     def execute_entry(self, signal: Dict) -> bool:
-        """Execute entry order"""
+        """Execute entry order with retry logic and quantity reconciliation"""
         entry_price = signal['entry_price']
         quantity = self.calculate_position_size(entry_price)
         
@@ -402,41 +481,59 @@ class LSTMLiveTradingStrategy:
             return False
         
         try:
-            print(f"\n📊 Placing BUY order:")
-            print(f"   Price: ${entry_price:,.2f}")
-            print(f"   Quantity: {quantity} {self.base_currency}")
-            print(f"   Value: ${entry_price * quantity:,.2f}")
-            print(f"   Probability: {signal['prediction_prob']:.4f}")
-            logger.info(f"\n📊 Placing BUY order:")
-            logger.info(f"   Price: ${entry_price:,.2f}")
-            logger.info(f"   Quantity: {quantity} {self.base_currency}")
-            logger.info(f"   Value: ${entry_price * quantity:,.2f}")
-            logger.info(f"   Probability: {signal['prediction_prob']:.4f}")
+            logger.info(f"[{self.pair}] BUY: qty={quantity}, price=${entry_price:.2f}, prob={signal['prediction_prob']:.4f}")
             
             if not self.dry_run:
-                # Place market buy order
-                response = self.client.buy(self.pair, quantity)
+                # Place market buy order with retry
+                max_retries = 3
+                actual_entry = None
+                order_id = None
                 
-                if response.get('Success'):
-                    order_detail = response.get('OrderDetail', {})
-                    actual_entry = order_detail.get('FilledAverPrice', entry_price)
-                    order_id = order_detail.get('OrderID')
-                    
-                    print(f"✅ Buy order executed! Order ID: {order_id}")
-                    print(f"   Filled at: ${actual_entry:,.2f}")
-                    logger.info(f"✅ Buy order executed! Order ID: {order_id}")
-                    logger.info(f"   Filled at: ${actual_entry:,.2f}")
-                else:
-                    print(f"❌ Buy order failed: {response.get('ErrMsg')}")
-                    logger.error(f"❌ Buy order failed: {response.get('ErrMsg')}")
+                for attempt in range(max_retries):
+                    try:
+                        response = self.client.buy(self.pair, quantity)
+                        
+                        if response.get('Success'):
+                            order_detail = response.get('OrderDetail', {})
+                            actual_entry = float(order_detail.get('FilledAverPrice', 0) or entry_price)
+                            order_id = order_detail.get('OrderID')
+                            
+                            if actual_entry > 0:
+                                logger.info(f"[{self.pair}] Buy SUCCESS: ID={order_id}, filled=${actual_entry:.2f}")
+                                break
+                            else:
+                                logger.warning(f"[{self.pair}] Buy returned 0 price, retrying...")
+                        else:
+                            logger.warning(f"[{self.pair}] Buy failed (attempt {attempt+1}/{max_retries}): {response.get('ErrMsg')}")
+                        
+                        if attempt < max_retries - 1:
+                            time.sleep(1.0)
+                    except Exception as e:
+                        logger.error(f"[{self.pair}] Buy error (attempt {attempt+1}/{max_retries}): {e}")
+                        if attempt < max_retries - 1:
+                            time.sleep(1.0)
+                
+                if actual_entry is None or actual_entry <= 0:
+                    logger.error(f"[{self.pair}] Buy FAILED after {max_retries} attempts")
                     return False
+                
+                # Reconcile actual filled quantity from wallet
+                free, _locked = self._get_asset_free_locked(self.base_currency)
+                actual_qty = self.round_quantity(min(quantity, max(0.0, free)))
+                
+                if actual_qty <= 0:
+                    logger.error(f"[{self.pair}] No tradeable quantity after fill: requested={quantity}, free={free}")
+                    return False
+                
+                # Use actual filled quantity
+                quantity = actual_qty
             else:
                 # Dry run mode
                 actual_entry = entry_price
                 order_id = None
-                logger.info(f"✅ [DRY RUN] Would buy {quantity} {self.base_currency} @ ${entry_price:,.2f}")
+                logger.info(f"[{self.pair}] [DRY RUN] Buy {quantity} @ ${entry_price:.2f}")
             
-            # Create position
+            # Create position with actual filled quantity
             entry_time = datetime.now()
             self.position = Position(
                 symbol=self.pair,
@@ -506,7 +603,7 @@ class LSTMLiveTradingStrategy:
             return False
     
     def execute_exit(self, current_price: float, reason: str) -> bool:
-        """Execute exit order"""
+        """Execute exit order with retry logic"""
         if self.position is None:
             logger.warning("No position to exit")
             return False
@@ -523,49 +620,49 @@ class LSTMLiveTradingStrategy:
             pnl_pct = (exit_price - self.position.entry_price) / self.position.entry_price * 100
             pnl_value = (exit_price - self.position.entry_price) * self.position.quantity
             
-            print(f"\n📊 Placing SELL order:")
-            print(f"   Exit Price: ${exit_price:,.2f}")
-            print(f"   Current Price: ${current_price:,.2f}")
-            print(f"   Quantity: {self.position.quantity} {self.base_currency}")
-            print(f"   Reason: {reason}")
-            print(f"   PnL: {pnl_pct:+.2f}% (${pnl_value:+,.2f})")
-            print(f"   Hold duration: {self.position.periods_held} periods")
-            logger.info(f"\n📊 Placing SELL order:")
-            logger.info(f"   Exit Price: ${exit_price:,.2f}")
-            logger.info(f"   Current Price: ${current_price:,.2f}")
-            logger.info(f"   Quantity: {self.position.quantity} {self.base_currency}")
-            logger.info(f"   Reason: {reason}")
-            logger.info(f"   PnL: {pnl_pct:+.2f}% (${pnl_value:+,.2f})")
-            logger.info(f"   Hold duration: {self.position.periods_held} periods")
+            logger.info(f"[{self.pair}] SELL: reason={reason}, qty={self.position.quantity}, exit=${exit_price:.2f}, PnL={pnl_pct:+.2f}%, held={self.position.periods_held}p")
             
             if not self.dry_run:
-                # Place market sell order
-                response = self.client.sell(self.pair, self.position.quantity)
+                # Place market sell order with retry
+                max_retries = 3
+                actual_exit = None
+                order_id = None
                 
-                if response.get('Success'):
-                    order_detail = response.get('OrderDetail', {})
-                    actual_exit = order_detail.get('FilledAverPrice', current_price)
-                    order_id = order_detail.get('OrderID')
-                    
-                    # Recalculate P&L with actual exit price
-                    pnl_pct = (actual_exit - self.position.entry_price) / self.position.entry_price * 100
-                    pnl_value = (actual_exit - self.position.entry_price) * self.position.quantity
-                    
-                    print(f"✅ Sell order executed! Order ID: {order_id}")
-                    print(f"   Filled at: ${actual_exit:,.2f}")
-                    print(f"   Final PnL: {pnl_pct:+.2f}% (${pnl_value:+,.2f})")
-                    logger.info(f"✅ Sell order executed! Order ID: {order_id}")
-                    logger.info(f"   Filled at: ${actual_exit:,.2f}")
-                    logger.info(f"   Final PnL: {pnl_pct:+.2f}% (${pnl_value:+,.2f})")
-                else:
-                    print(f"❌ Sell order failed: {response.get('ErrMsg')}")
-                    logger.error(f"❌ Sell order failed: {response.get('ErrMsg')}")
+                for attempt in range(max_retries):
+                    try:
+                        response = self.client.sell(self.pair, self.position.quantity)
+                        
+                        if response.get('Success'):
+                            order_detail = response.get('OrderDetail', {})
+                            actual_exit = float(order_detail.get('FilledAverPrice', 0) or current_price)
+                            order_id = order_detail.get('OrderID')
+                            
+                            if actual_exit > 0:
+                                # Recalculate P&L with actual exit price
+                                pnl_pct = (actual_exit - self.position.entry_price) / self.position.entry_price * 100
+                                pnl_value = (actual_exit - self.position.entry_price) * self.position.quantity
+                                logger.info(f"[{self.pair}] Sell SUCCESS: ID={order_id}, filled=${actual_exit:.2f}, PnL={pnl_pct:+.2f}%")
+                                break
+                            else:
+                                logger.warning(f"[{self.pair}] Sell returned 0 price, retrying...")
+                        else:
+                            logger.warning(f"[{self.pair}] Sell failed (attempt {attempt+1}/{max_retries}): {response.get('ErrMsg')}")
+                        
+                        if attempt < max_retries - 1:
+                            time.sleep(1.0)
+                    except Exception as e:
+                        logger.error(f"[{self.pair}] Sell error (attempt {attempt+1}/{max_retries}): {e}")
+                        if attempt < max_retries - 1:
+                            time.sleep(1.0)
+                
+                if actual_exit is None or actual_exit <= 0:
+                    logger.error(f"[{self.pair}] Sell FAILED after {max_retries} attempts")
                     return False
             else:
                 # Dry run mode
                 actual_exit = current_price
                 order_id = None
-                logger.info(f"✅ [DRY RUN] Would sell {self.position.quantity} {self.base_currency} @ ${current_price:,.2f}")
+                logger.info(f"[{self.pair}] [DRY RUN] Sell {self.position.quantity} @ ${current_price:.2f}")
             
             # Calculate fees
             fee_rate = self.fee_bps / 10000
@@ -575,8 +672,11 @@ class LSTMLiveTradingStrategy:
             # Update cash (add exit proceeds - fees)
             self._add_exit_proceeds(self.position.quantity, actual_exit, fee)
             
-            # Update equity (now all in cash)
-            self.equity = self.cash
+            # Sync equity from live account if not dry run
+            if not self.dry_run:
+                self.cash, self.equity = self._sync_account_balance()
+            else:
+                self.equity = self.cash
             
             # Log to Supabase
             if hasattr(self.position, 'trade_id') and self.position.trade_id:
@@ -785,15 +885,9 @@ class LSTMLiveTrader:
         """Run one iteration of the trading loop"""
         from datetime import timezone, timedelta
         
-        # Get current time in both UTC and HKT
+        # Get current time
         now_utc = datetime.now(timezone.utc)
-        hkt = timezone(timedelta(hours=8))
-        now_hkt = now_utc.astimezone(hkt)
-        
-        print("\n" + "=" * 70)
-        print(f"⏰ {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC ({now_hkt.strftime('%H:%M:%S')} HKT)")
-        print("=" * 70)
-        logger.info("\n" + "=" * 70)
+        logger.info("=" * 70)
         logger.info(f"⏰ {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC")
         logger.info("=" * 70)
         
@@ -801,14 +895,8 @@ class LSTMLiveTrader:
         self.data_feed.update_latest_candles(num_candles=10)
         
         # Get current candle data (including high/low)
-        print(f"DEBUG: Candle buffer size: {len(self.data_feed.candle_buffer.candles)}")
-        if len(self.data_feed.candle_buffer.candles) > 0:
-            last_candle = self.data_feed.candle_buffer.candles[-1]
-            last_candle_hkt = last_candle.timestamp.replace(tzinfo=timezone.utc).astimezone(hkt)
-            print(f"DEBUG: Last candle in buffer: {last_candle.timestamp} UTC ({last_candle_hkt.strftime('%Y-%m-%d %H:%M:%S')} HKT)")
         if len(self.data_feed.candle_buffer.candles) == 0:
             logger.warning("No candle data available")
-            print("WARNING: No candle data available")
             return
         
         current_candle = self.data_feed.candle_buffer.candles[-1]
@@ -816,21 +904,11 @@ class LSTMLiveTrader:
         current_high = current_candle.high
         current_low = current_candle.low
         
-        print(f"\n💰 Current {self.pair} candle:")
-        print(f"   Close: ${current_price:,.2f}")
-        print(f"   High: ${current_high:,.2f}")
-        print(f"   Low: ${current_low:,.2f}")
-        logger.info(f"\n💰 Current {self.pair} candle:")
-        logger.info(f"   Close: ${current_price:,.2f}")
-        logger.info(f"   High: ${current_high:,.2f}")
-        logger.info(f"   Low: ${current_low:,.2f}")
+        logger.info(f"💰 {self.pair}: close=${current_price:.2f}, high=${current_high:.2f}, low=${current_low:.2f}")
         
         # Check balance
         balance = self.strategy.get_balance()
-        print(f"💼 Balance: {balance['base']:.6f} {self.strategy.base_currency}, "
-                   f"${balance['quote']:,.2f} {self.strategy.quote_currency}")
-        logger.info(f"💼 Balance: {balance['base']:.6f} {self.strategy.base_currency}, "
-                   f"${balance['quote']:,.2f} {self.strategy.quote_currency}")
+        logger.info(f"💼 Balance: {balance['base']:.6f} {self.strategy.base_currency}, ${balance['quote']:.2f} {self.strategy.quote_currency}")
         
         # Check if we have a position
         if self.strategy.position is not None:
@@ -849,34 +927,24 @@ class LSTMLiveTrader:
             
             pnl_pct = (current_price - self.strategy.position.entry_price) / self.strategy.position.entry_price * 100
             
-            print(f"\n📈 Current Position:")
-            print(f"   Entry: ${self.strategy.position.entry_price:,.2f}")
-            print(f"   Current: ${current_price:,.2f}")
-            print(f"   PnL: {pnl_pct:+.2f}%")
-            print(f"   Periods held: {self.strategy.position.periods_held}/{self.strategy.max_hold_periods}")
-            print(f"   Stop Loss: ${self.strategy.position.stop_loss:,.2f}")
-            print(f"   Take Profit: ${self.strategy.position.take_profit:,.2f}")
-            logger.info(f"\n📈 Current Position:")
-            logger.info(f"   Entry: ${self.strategy.position.entry_price:,.2f}")
-            logger.info(f"   Current: ${current_price:,.2f}")
-            logger.info(f"   PnL: {pnl_pct:+.2f}%")
-            logger.info(f"   Periods held: {self.strategy.position.periods_held}/{self.strategy.max_hold_periods}")
-            logger.info(f"   Stop Loss: ${self.strategy.position.stop_loss:,.2f}")
-            logger.info(f"   Take Profit: ${self.strategy.position.take_profit:,.2f}")
+            logger.info(f"📈 Position: entry=${self.strategy.position.entry_price:.2f}, current=${current_price:.2f}, PnL={pnl_pct:+.2f}%, held={self.strategy.position.periods_held}/{self.strategy.max_hold_periods}")
             
             # Check exit conditions (pass high/low for accurate detection)
             exit_reason = self.strategy.check_exit_signal(current_price, current_high, current_low)
             
             if exit_reason:
-                print(f"\n🚨 Exit signal: {exit_reason}")
-                logger.info(f"\n🚨 Exit signal: {exit_reason}")
-                self.strategy.execute_exit(current_price, exit_reason)
+                logger.info(f"🚨 Exit signal: {exit_reason}")
+                success = self.strategy.execute_exit(current_price, exit_reason)
+                if success:
+                    # Print trade summary
+                    summary = self.strategy.get_trade_summary()
+                    logger.info(f"📊 Summary: trades={summary['total_trades']}, win_rate={summary['win_rate']*100:.1f}%, total_pnl=${summary['total_pnl']:.2f}, avg_pnl={summary['avg_pnl_pct']:.2f}%")
+                else:
+                    logger.error(f"❌ Failed to close position")
         else:
             try:
                 df_closed = self.data_feed.get_latest_data(lookback_periods=1, include_partial=False)
-                print(f"DEBUG: df_closed shape: {df_closed.shape}, empty: {df_closed.empty}")
                 if not df_closed.empty:
-                    print(f"DEBUG: df_closed last timestamp: {df_closed['timestamp'].iloc[-1]}")
                     last_closed_ts = pd.to_datetime(df_closed['timestamp'].iloc[-1]).to_pydatetime().replace(tzinfo=None)
                     should_check = (self.last_checked_closed_ts is None) or (last_closed_ts > self.last_checked_closed_ts)
                     
@@ -886,16 +954,12 @@ class LSTMLiveTrader:
                     last_closed_hkt = last_closed_ts.replace(tzinfo=timezone.utc).astimezone(hkt)
                     last_checked_hkt = self.last_checked_closed_ts.replace(tzinfo=timezone.utc).astimezone(hkt) if self.last_checked_closed_ts else None
                     
-                    print(f"DEBUG: should_check={should_check}")
-                    print(f"       Last closed candle: {last_closed_ts} UTC ({last_closed_hkt.strftime('%Y-%m-%d %H:%M:%S')} HKT)")
-                    if last_checked_hkt:
-                        print(f"       Last checked: {self.last_checked_closed_ts} UTC ({last_checked_hkt.strftime('%Y-%m-%d %H:%M:%S')} HKT)")
-                    
                     if should_check:
-                        print("DEBUG: Checking entry signal...")
                         signal = self.strategy.check_entry_signal(current_price)
                         if signal:
-                            self.strategy.execute_entry(signal)
+                            success = self.strategy.execute_entry(signal)
+                            if not success:
+                                logger.error(f"❌ Failed to enter position")
                         self.last_checked_closed_ts = last_closed_ts
                     else:
                         # Show prediction even when waiting for new candle
@@ -905,28 +969,12 @@ class LSTMLiveTrader:
                         if not df.empty and len(df) >= self.strategy.preprocessor.sequence_length:
                             # Generate prediction
                             prob = self.strategy.predict(df)
-                            print(f"🤖 Model prediction: {prob:.4f}")
                             logger.info(f"🤖 Model prediction: {prob:.4f}")
-                        
-                        # Compute next candle close from current time (next timeframe boundary)
-                        period = self.timeframe_minutes
-                        current_period_start = now_utc.replace(minute=(now_utc.minute // period) * period, second=0, microsecond=0)
-                        next_candle_utc = current_period_start + timedelta(minutes=period)
-                        next_candle_hkt = next_candle_utc.replace(tzinfo=timezone.utc).astimezone(hkt)
-                        print(f"\n⏸️  Waiting for new candle")
-                        print(f"   Next candle closes at: {next_candle_utc.strftime('%H:%M')} UTC ({next_candle_hkt.strftime('%H:%M')} HKT)")
-                        logger.info(f"\n⏸️  Waiting for new candle (next: {next_candle_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC)")
             except Exception as e:
                 logger.error(f"Error checking entry signal: {e}")
         
-        # Print trade summary
-        summary = self.strategy.get_trade_summary()
-        if summary['total_trades'] > 0:
-            logger.info(f"\n📊 Trade Summary:")
-            logger.info(f"   Total trades: {summary['total_trades']}")
-            logger.info(f"   Win rate: {summary['win_rate']*100:.1f}%")
-            logger.info(f"   Avg PnL: {summary['avg_pnl_pct']:+.2f}%")
-            logger.info(f"   Total PnL: ${summary['total_pnl']:+,.2f}")
+        # Print current equity
+        logger.info(f"💼 Portfolio: cash=${self.strategy.cash:.2f}, equity=${self.strategy.equity:.2f}")
     
     def run(self, duration_hours: Optional[int] = None):
         """
