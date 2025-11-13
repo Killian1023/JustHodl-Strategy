@@ -2,96 +2,131 @@
 Fetch historical data from Binance US API to warm up indicators
 """
 
-import requests
-import pandas as pd
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, List
-import time
 import os
 import sys
+import time
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+import requests
+
 # Ensure project root (JustHodl-Strategy) is on sys.path so 'utils' is importable when run directly
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from utils.config import BINANCE_URL
+
+from utils.config import (
+    BINANCE_KLINES_PATH,
+    BINANCE_PROXY_KLINES_PATH,
+    BINANCE_PROXY_URL,
+    BINANCE_URL,
+    USE_BINANCE_PROXY,
+)
+
+
+def _resolve_klines_endpoint() -> Tuple[str, str, bool]:
+    """Determine which base URL/path to use for klines requests."""
+    if USE_BINANCE_PROXY and BINANCE_PROXY_URL:
+        return BINANCE_PROXY_URL.rstrip("/"), BINANCE_PROXY_KLINES_PATH, True
+    return BINANCE_URL.rstrip("/"), BINANCE_KLINES_PATH, False
+
+
+def _parse_proxy_payload(payload: Dict) -> Optional[List[Dict]]:
+    """Normalize proxy response into list of klines."""
+    if not payload.get("success", False):
+        error_msg = payload.get("error", "Unknown error")
+        print(f"Proxy error: {error_msg}")
+        return None
+    data = payload.get("data", [])
+    if not isinstance(data, list) or not data:
+        return []
+    return data
+
+
+def _normalize_klines(raw: List) -> pd.DataFrame:
+    """Convert proxy or direct kline payloads into OHLCV dataframe."""
+    if not raw:
+        return pd.DataFrame()
+
+    if isinstance(raw[0], dict):
+        df = pd.DataFrame(raw)
+        df["timestamp"] = pd.to_datetime(df["openTime"], unit="ms", utc=True)
+        df = df.rename(
+            columns={
+                "openPrice": "open",
+                "highPrice": "high",
+                "lowPrice": "low",
+                "closePrice": "close",
+            }
+        )
+    else:
+        cols = [
+            "openTime",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "closeTime",
+            "quoteAssetVolume",
+            "numberOfTrades",
+            "takerBuyBaseVolume",
+            "takerBuyQuoteVolume",
+            "ignore",
+        ]
+        df = pd.DataFrame(raw, columns=cols)
+        df["timestamp"] = pd.to_datetime(df["openTime"], unit="ms", utc=True)
+
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+    df.set_index("timestamp", inplace=True)
+    return df[["open", "high", "low", "close", "volume"]]
 
 
 def fetch_binance_klines(symbol: str, interval: str = "5m", limit: int = 500) -> pd.DataFrame:
     """
-    Fetch recent candles from Binance API.
-    
+    Fetch recent candles from Binance (direct) or proxy API.
+
     Args:
         symbol: Binance symbol (e.g., "BTCUSDT")
         interval: Timeframe (1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M)
         limit: Number of candles to fetch (max 1000)
-    
+
     Returns:
         DataFrame with OHLCV data
     """
-    url = f"{BINANCE_URL.rstrip('/')}/api/klines"
-    
-    # Binance supports up to 1000 candles per request
-    limit = min(limit, 1000)
-    
+
+    base_url, path, using_proxy = _resolve_klines_endpoint()
+    url = f"{base_url}{path}"
+
     params = {
         "symbol": symbol,
         "interval": interval,
-        "limit": limit
+        "limit": min(limit, 1000),
     }
-    
+
     try:
         response = requests.get(url, params=params, timeout=15)
         response.raise_for_status()
-        result = response.json()
-        
-        # Handle custom proxy response format (wrapped in success/data)
-        if isinstance(result, dict):
-            if not result.get('success', False):
-                error_msg = result.get('error', 'Unknown error')
-                print(f"API error for {symbol}: {error_msg}")
+        payload = response.json()
+
+        if using_proxy:
+            normalized = _parse_proxy_payload(payload)
+            if normalized is None:
                 return pd.DataFrame()
-            raw = result.get('data', [])
         else:
-            # Direct array response (standard Binance format)
-            raw = result
-        
-        if not isinstance(raw, list) or len(raw) == 0:
-            print(f"No data returned for {symbol}")
-            return pd.DataFrame()
-        
-        # Check if data is in object format (custom proxy) or array format (standard Binance)
-        if isinstance(raw[0], dict):
-            # Custom proxy format with named fields
-            df = pd.DataFrame(raw)
-            df['timestamp'] = pd.to_datetime(df['openTime'], unit='ms', utc=True)
-            df = df.rename(columns={
-                'openPrice': 'open',
-                'highPrice': 'high',
-                'lowPrice': 'low',
-                'closePrice': 'close'
-            })
-        else:
-            # Standard Binance array format
-            # [ openTime, open, high, low, close, volume, closeTime, quoteAssetVolume,
-            #   numberOfTrades, takerBuyBaseVolume, takerBuyQuoteVolume, ignore ]
-            cols = [
-                'openTime','open','high','low','close','volume','closeTime',
-                'quoteAssetVolume','numberOfTrades','takerBuyBaseVolume','takerBuyQuoteVolume','ignore'
-            ]
-            df = pd.DataFrame(raw, columns=cols)
-            df['timestamp'] = pd.to_datetime(df['openTime'], unit='ms', utc=True)
-        
-        # Convert types
-        for col in ['open','high','low','close','volume']:
-            df[col] = df[col].astype(float)
-        df.set_index('timestamp', inplace=True)
-        df = df[['open','high','low','close','volume']]
+            normalized = payload
+
+        df = _normalize_klines(normalized)
+        if df.empty:
+            print(f"No data returned for {symbol} from {'proxy' if using_proxy else 'Binance'} API")
         return df
-    
-    except requests.exceptions.RequestException as e:
-        print(f"Network error fetching {symbol}: {e}")
+
+    except requests.exceptions.RequestException as exc:
+        print(f"Network error fetching {symbol}: {exc}")
         return pd.DataFrame()
-    except Exception as e:
-        print(f"Error fetching {symbol} data from Binance: {e}")
+    except Exception as exc:
+        print(f"Error parsing klines for {symbol}: {exc}")
         import traceback
+
         traceback.print_exc()
         return pd.DataFrame()
 

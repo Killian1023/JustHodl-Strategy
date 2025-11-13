@@ -28,6 +28,10 @@ class AlmaParams:
     # Risk model
     last_n_len: int = 10             # optimized
     rr_multiplier: float = 2.0       # optimized
+    
+    # ATR Swing Stop parameters
+    atr_len: int = 14                # ATR period (optimized)
+    atr_mult: float = 1.0            # ATR multiplier for stop buffer (optimized)
 
 
 # ========= Portfolio & risk =========
@@ -36,6 +40,8 @@ PORTFOLIO_CONFIG = {
     "max_concurrent_positions": 3,
     "position_size_pct": 18,
     "fee_bps": 10.0,
+    "clear_account_on_start": True,
+    "clear_account_on_end": True,
 }
 
 RISK_CONFIG = {
@@ -233,6 +239,8 @@ def load_trading_pairs_from_env() -> Dict[str, AlmaParams]:
             offset_alma = float(os.getenv(f'{pair_key}_OFFSET_ALMA', 0.85))
             last_n_len = int(os.getenv(f'{pair_key}_LAST_N_LEN', 10))
             rr_multiplier = float(os.getenv(f'{pair_key}_RR_MULTIPLIER', 2.0))
+            atr_len = int(os.getenv(f'{pair_key}_ATR_LEN', 14))
+            atr_mult = float(os.getenv(f'{pair_key}_ATR_MULT', 1.0))
             
             trading_pairs[pair] = AlmaParams(
                 base_tf_min=TIMEFRAME_MINUTES,
@@ -242,6 +250,8 @@ def load_trading_pairs_from_env() -> Dict[str, AlmaParams]:
                 offset_alma=offset_alma,
                 last_n_len=last_n_len,
                 rr_multiplier=rr_multiplier,
+                atr_len=atr_len,
+                atr_mult=atr_mult,
             )
         except (ValueError, TypeError) as e:
             print(f"Warning: Failed to load parameters for {pair}: {e}")
@@ -263,6 +273,8 @@ if not TRADING_PAIRS:
             offset_alma=0.32,
             last_n_len=28,
             rr_multiplier=1.25,
+            atr_len=14,
+            atr_mult=1.0,
         ),
         "ETH/USD": AlmaParams(
             base_tf_min=TIMEFRAME_MINUTES,
@@ -272,6 +284,8 @@ if not TRADING_PAIRS:
             offset_alma=0.28,
             last_n_len=25,
             rr_multiplier=1.30,
+            atr_len=14,
+            atr_mult=1.0,
         ),
     }
 

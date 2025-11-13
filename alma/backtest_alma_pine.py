@@ -29,6 +29,10 @@ class Params:
     # New TP/SL model: SL = lowest low of last_n_len bars; TP = entry + rr*(entry - SL)
     last_n_len: int = 10                  # subject to GA
     rr_multiplier: float = 1.5            # subject to GA
+    # Stop model (new): "swing" (default) or "atr_swing" (volatility-buffered swing)
+    stop_mode: str = "swing"
+    atr_len: int = 14
+    atr_mult: float = 1.0
 
 
 @dataclass
@@ -114,6 +118,22 @@ def alma(src: pd.Series, length: int, offset: float, sigma: float) -> pd.Series:
     return src.rolling(length).apply(lambda x: alma_row(x.values), raw=False)
 
 
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+
+def atr(df: pd.DataFrame, length: int) -> pd.Series:
+    if length <= 1:
+        return (df['high'] - df['low']).abs()
+    tr = true_range(df['high'], df['low'], df['close'])
+    # Use Wilder's smoothing approximation via EMA with alpha=1/length
+    return tr.ewm(alpha=1.0/float(max(1, length)), adjust=False, min_periods=length).mean()
+
+
 def linreg(src: pd.Series, length: int, offset: int) -> pd.Series:
     # Least squares moving average similar to Pine's ta.linreg
     if length <= 1:
@@ -192,6 +212,9 @@ def backtest_with_data(base: pd.DataFrame, alt: pd.DataFrame, p: Params) -> Tupl
 
     idx = list(result.index)
 
+    # Pre-compute ATR on base timeframe for volatility-buffered SL if requested
+    atr_series = atr(result, max(2, int(p.atr_len))) if getattr(p, 'stop_mode', 'swing') == 'atr_swing' else None
+
     # Detect bars where ALT value updated (i.e., higher TF closed)
     alt_changed = (result['closeSeriesAlt'] != result['closeSeriesAlt'].shift(1)) | (result['openSeriesAlt'] != result['openSeriesAlt'].shift(1))
 
@@ -231,13 +254,20 @@ def backtest_with_data(base: pd.DataFrame, alt: pd.DataFrame, p: Params) -> Tupl
                 entry_price = filled
                 position = 'long'
                 trades.append(Trade('long', ts, filled, qty))
-                # Set SL/TP at entry using lowest low over last_n_len PREVIOUS bars (exclude current bar to avoid lookahead)
+                # Set SL/TP at entry using selected stop model over PREVIOUS bars (exclude current bar to avoid lookahead)
                 lo_start = max(0, i - p.last_n_len)
-                window_low = result['low'].iloc[lo_start:i].min()
-                current_sl = float(window_low)
-                # If SL >= entry, set a minimal buffer to avoid invalid RR
+                window_low = float(result['low'].iloc[lo_start:i].min())
+                if getattr(p, 'stop_mode', 'swing') == 'atr_swing' and atr_series is not None:
+                    # Use ATR from previous bar to avoid lookahead
+                    atr_val = float(atr_series.iloc[i - 1]) if i - 1 >= 0 and math.isfinite(float(atr_series.iloc[i - 1])) else 0.0
+                    current_sl = window_low - float(p.atr_mult) * max(0.0, atr_val)
+                else:
+                    current_sl = window_low
+                # If SL >= entry or invalid, set a minimal buffer to avoid invalid RR
                 if not math.isfinite(current_sl) or current_sl >= entry_price:
-                    current_sl = entry_price * 0.995
+                    # fallback: nudge below entry by small fraction of price or ATR
+                    fallback = (float(p.atr_mult) * float(atr_series.iloc[i - 1]) if atr_series is not None and i - 1 >= 0 and math.isfinite(float(atr_series.iloc[i - 1])) else entry_price * 0.005)
+                    current_sl = entry_price - max(1e-9, fallback)
                 rr = max(0.01, float(p.rr_multiplier))
                 current_tp = entry_price + rr * (entry_price - current_sl)
             pending_entry = None
@@ -301,7 +331,8 @@ def summarize(trades: List[Trade], initial_capital: float, final_equity: float,
     gross_profit = sum((t.pnl or 0) for t in trades if (t.pnl or 0) > 0)
     gross_loss = -sum((t.pnl or 0) for t in trades if (t.pnl or 0) < 0)
     if gross_loss <= 0 and gross_profit > 0:
-        profit_factor = float('inf')
+        # No losing trades: use a reasonable cap instead of infinity
+        profit_factor = 100.0
     elif gross_loss <= 0:
         profit_factor = 0.0
     else:
@@ -344,7 +375,7 @@ def summarize(trades: List[Trade], initial_capital: float, final_equity: float,
         'total_pnl_quote': round(total_pnl, 2),
         'final_equity': round(final_equity, 2),
         'return_pct': round(ret_pct, 2),
-        'profit_factor': float(profit_factor if profit_factor != float('inf') else 1e9),
+        'profit_factor': float(profit_factor),
         'calmar': float(calmar if calmar != float('inf') else 1e3),
         'max_drawdown_pct': round(max_dd * 100.0, 2),
         'cagr_pct': round(cagr * 100.0, 2),
@@ -480,6 +511,7 @@ def run_ga_on_last_3m_opt_last_1m_test(raw_1m: pd.DataFrame, p_base: Params, pop
     opt_month_indices = _month_slices(base_opt.index)
 
     # Parameter bounds
+    forced_stop = getattr(p_base, 'force_stop_mode', None)
     def random_params() -> Params:
         p = Params(csv_path=p_base.csv_path, base_tf_min=p_base.base_tf_min)
         p.alt_multiplier = int(rng.integers(2, 17))
@@ -488,6 +520,10 @@ def run_ga_on_last_3m_opt_last_1m_test(raw_1m: pd.DataFrame, p_base: Params, pop
         p.offset_alma = float(rng.uniform(0.05, 0.95))
         p.last_n_len = int(rng.integers(3, 51))
         p.rr_multiplier = float(rng.uniform(0.5, 4.0))
+        # New ATR-swing stop params
+        p.stop_mode = forced_stop if forced_stop else 'atr_swing'
+        p.atr_len = int(rng.integers(7, 29))
+        p.atr_mult = float(rng.uniform(0.5, 2.0))
         return p
 
     def mutate(p: Params) -> Params:
@@ -498,6 +534,9 @@ def run_ga_on_last_3m_opt_last_1m_test(raw_1m: pd.DataFrame, p_base: Params, pop
         q.offset_alma = float(np.clip(p.offset_alma + rng.normal(0, 0.05), 0.01, 0.99))
         q.last_n_len = int(np.clip(p.last_n_len + rng.integers(-3, 4), 2, 60))
         q.rr_multiplier = float(np.clip(p.rr_multiplier + rng.normal(0, 0.2), 0.2, 6.0))
+        q.stop_mode = forced_stop if forced_stop else getattr(p, 'stop_mode', 'atr_swing')
+        q.atr_len = int(np.clip(getattr(p, 'atr_len', 14) + rng.integers(-3, 4), 5, 40))
+        q.atr_mult = float(np.clip(getattr(p, 'atr_mult', 1.0) + rng.normal(0, 0.1), 0.2, 3.0))
         return q
 
     # Build evaluation context for optional multiprocessing
@@ -571,7 +610,8 @@ def run_ga_on_last_3m_opt_last_1m_test(raw_1m: pd.DataFrame, p_base: Params, pop
         print(f"[GA] Gen {g}/{gens}: kfold_score={top_score:.2f} ret~={top_summ.get('return_pct', 0):.2f}% PF~={top_summ.get('profit_factor', 0):.2f} "
               f"Calmar={top_summ.get('calmar', 0):.2f} trades~={top_summ.get('trades', 0)} "
               f"alt_mult={top_indiv.alt_multiplier} basis_len={top_indiv.basis_len} sigma={top_indiv.offset_sigma} "
-              f"m={top_indiv.offset_alma:.3f} last_n={top_indiv.last_n_len} rr={top_indiv.rr_multiplier:.2f}", flush=True)
+              f"m={top_indiv.offset_alma:.3f} last_n={top_indiv.last_n_len} rr={top_indiv.rr_multiplier:.2f} "
+              f"stop={getattr(top_indiv, 'stop_mode', 'swing')} atr_len={getattr(top_indiv, 'atr_len', 0)} atr_mult={getattr(top_indiv, 'atr_mult', 0.0):.2f}", flush=True)
         # Robustness check: perturb top_indiv and penalize instability
         def perturb_once(ind: Params) -> Params:
             r = Params(csv_path=ind.csv_path, base_tf_min=ind.base_tf_min)
@@ -581,6 +621,9 @@ def run_ga_on_last_3m_opt_last_1m_test(raw_1m: pd.DataFrame, p_base: Params, pop
             r.offset_alma = float(np.clip(ind.offset_alma + rng.normal(0, robust_noise), 0.01, 0.99))
             r.last_n_len = int(np.clip(ind.last_n_len + rng.integers(-3, 4), 2, 60))
             r.rr_multiplier = float(np.clip(ind.rr_multiplier + rng.normal(0, robust_noise), 0.2, 6.0))
+            r.stop_mode = forced_stop if forced_stop else getattr(ind, 'stop_mode', 'atr_swing')
+            r.atr_len = int(np.clip(getattr(ind, 'atr_len', 14) + rng.integers(-2, 3), 5, 40))
+            r.atr_mult = float(np.clip(getattr(ind, 'atr_mult', 1.0) + rng.normal(0, robust_noise / 2), 0.2, 3.0))
             return r
 
         robust_scores = []
@@ -720,6 +763,7 @@ def run_ga_on_30_30_30_train_10_test(raw_1m: pd.DataFrame, p_base: Params, pop: 
     }
 
     # Parameter bounds
+    forced_stop = getattr(p_base, 'force_stop_mode', None)
     def random_params() -> Params:
         p = Params(csv_path=p_base.csv_path, base_tf_min=p_base.base_tf_min)
         p.alt_multiplier = int(rng.integers(2, 17))
@@ -728,6 +772,9 @@ def run_ga_on_30_30_30_train_10_test(raw_1m: pd.DataFrame, p_base: Params, pop: 
         p.offset_alma = float(rng.uniform(0.05, 0.95))
         p.last_n_len = int(rng.integers(3, 51))
         p.rr_multiplier = float(rng.uniform(0.5, 4.0))
+        p.stop_mode = forced_stop if forced_stop else 'atr_swing'
+        p.atr_len = int(rng.integers(7, 29))
+        p.atr_mult = float(rng.uniform(0.5, 2.0))
         return p
 
     def mutate(p: Params) -> Params:
@@ -738,6 +785,9 @@ def run_ga_on_30_30_30_train_10_test(raw_1m: pd.DataFrame, p_base: Params, pop: 
         q.offset_alma = float(np.clip(p.offset_alma + rng.normal(0, 0.05), 0.01, 0.99))
         q.last_n_len = int(np.clip(p.last_n_len + rng.integers(-3, 4), 2, 60))
         q.rr_multiplier = float(np.clip(p.rr_multiplier + rng.normal(0, 0.2), 0.2, 6.0))
+        q.stop_mode = forced_stop if forced_stop else getattr(p, 'stop_mode', 'atr_swing')
+        q.atr_len = int(np.clip(getattr(p, 'atr_len', 14) + rng.integers(-3, 4), 5, 40))
+        q.atr_mult = float(np.clip(getattr(p, 'atr_mult', 1.0) + rng.normal(0, 0.1), 0.2, 3.0))
         return q
 
     robust_k = getattr(p_base, 'robust_k', 3) if hasattr(p_base, 'robust_k') else 3
@@ -791,7 +841,8 @@ def run_ga_on_30_30_30_train_10_test(raw_1m: pd.DataFrame, p_base: Params, pop: 
         print(f"[GA] Gen {g}/{gens}: kfold_score={top_score:.2f} ret~={top_summ.get('return_pct', 0):.2f}% PF~={top_summ.get('profit_factor', 0):.2f} "
               f"Calmar={top_summ.get('calmar', 0):.2f} trades~={top_summ.get('trades', 0)} "
               f"alt_mult={top_indiv.alt_multiplier} basis_len={top_indiv.basis_len} sigma={top_indiv.offset_sigma} "
-              f"m={top_indiv.offset_alma:.3f} last_n={top_indiv.last_n_len} rr={top_indiv.rr_multiplier:.2f}", flush=True)
+              f"m={top_indiv.offset_alma:.3f} last_n={top_indiv.last_n_len} rr={top_indiv.rr_multiplier:.2f} "
+              f"stop={getattr(top_indiv, 'stop_mode', 'swing')} atr_len={getattr(top_indiv, 'atr_len', 0)} atr_mult={getattr(top_indiv, 'atr_mult', 0.0):.2f}", flush=True)
 
         def perturb_once(ind: Params) -> Params:
             r = Params(csv_path=ind.csv_path, base_tf_min=ind.base_tf_min)
@@ -801,6 +852,9 @@ def run_ga_on_30_30_30_train_10_test(raw_1m: pd.DataFrame, p_base: Params, pop: 
             r.offset_alma = float(np.clip(ind.offset_alma + rng.normal(0, robust_noise), 0.01, 0.99))
             r.last_n_len = int(np.clip(ind.last_n_len + rng.integers(-3, 4), 2, 60))
             r.rr_multiplier = float(np.clip(ind.rr_multiplier + rng.normal(0, robust_noise), 0.2, 6.0))
+            r.stop_mode = forced_stop if forced_stop else getattr(ind, 'stop_mode', 'atr_swing')
+            r.atr_len = int(np.clip(getattr(ind, 'atr_len', 14) + rng.integers(-2, 3), 5, 40))
+            r.atr_mult = float(np.clip(getattr(ind, 'atr_mult', 1.0) + rng.normal(0, robust_noise / 2), 0.2, 3.0))
             return r
 
         robust_scores = []
